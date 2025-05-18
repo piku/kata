@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 
-"Kata Micro-PaaS - Piku refactor"
+"Kata Micro-PaaS - Kata refactor"
 
 try:
     from sys import version_info
-    assert version_info >= (3, 8)
+    assert version_info >= (3, 10)
 except AssertionError:
-    exit("Piku requires Python 3.8 or above")
+    exit("Kata requires Python 3.10 or above")
 
 from importlib import import_module
 from collections import defaultdict, deque
@@ -30,7 +30,7 @@ from time import sleep
 from traceback import format_exc
 from urllib.request import urlopen
 
-from click import argument, group, secho as echo, pass_context, CommandCollection
+
 
 # === Make sure we can access all system and user binaries ===
 
@@ -41,29 +41,29 @@ if '.local' not in environ['PATH']:
 
 # === Globals - all tweakable settings are here ===
 
-PIKU_RAW_SOURCE_URL = "https://raw.githubusercontent.com/piku/piku/master/refactor.py"
-PIKU_ROOT = environ.get('PIKU_ROOT', join(environ['HOME'], '.piku'))
-PIKU_BIN = join(environ['HOME'], 'bin')
-PIKU_SCRIPT = realpath(__file__)
-PIKU_PLUGIN_ROOT = abspath(join(PIKU_ROOT, "plugins"))
-APP_ROOT = abspath(join(PIKU_ROOT, "apps"))
-DATA_ROOT = abspath(join(PIKU_ROOT, "data"))
-ENV_ROOT = abspath(join(PIKU_ROOT, "envs"))
-GIT_ROOT = abspath(join(PIKU_ROOT, "repos"))
-LOG_ROOT = abspath(join(PIKU_ROOT, "logs"))
-CADDY_ROOT = abspath(join(PIKU_ROOT, "caddy"))
-CACHE_ROOT = abspath(join(PIKU_ROOT, "cache"))
-SYSTEMD_ROOT = abspath(join(PIKU_ROOT, "systemd"))
-PODMAN_ROOT = abspath(join(PIKU_ROOT, "podman"))
+KATA_RAW_SOURCE_URL = "https://raw.githubusercontent.com/piku/kata/main/refactor/kata.py"
+KATA_ROOT = environ.get('KATA_ROOT', join(environ['HOME'], '.piku'))
+KATA_BIN = join(environ['HOME'], 'bin')
+KATA_SCRIPT = realpath(__file__)
+KATA_PLUGIN_ROOT = abspath(join(KATA_ROOT, "plugins"))
+APP_ROOT = abspath(join(KATA_ROOT, "apps"))
+DATA_ROOT = abspath(join(KATA_ROOT, "data"))
+ENV_ROOT = abspath(join(KATA_ROOT, "envs"))
+GIT_ROOT = abspath(join(KATA_ROOT, "repos"))
+LOG_ROOT = abspath(join(KATA_ROOT, "logs"))
+CADDY_ROOT = abspath(join(KATA_ROOT, "caddy"))
+CACHE_ROOT = abspath(join(KATA_ROOT, "cache"))
+SYSTEMD_ROOT = abspath(join(KATA_ROOT, "systemd"))
+PODMAN_ROOT = abspath(join(KATA_ROOT, "podman"))
 ACME_ROOT = environ.get('ACME_ROOT', join(environ['HOME'], '.acme.sh'))
-ACME_WWW = abspath(join(PIKU_ROOT, "acme"))
+ACME_WWW = abspath(join(KATA_ROOT, "acme"))
 ACME_ROOT_CA = environ.get('ACME_ROOT_CA', 'letsencrypt.org')
 UNIT_PATTERN = "%s@%s.service"
 
-# === Make sure we can access piku user-installed binaries === #
+# === Make sure we can access kata user-installed binaries === #
 
-if PIKU_BIN not in environ['PATH']:
-    environ['PATH'] = PIKU_BIN + ":" + environ['PATH']
+if KATA_BIN not in environ['PATH']:
+    environ['PATH'] = KATA_BIN + ":" + environ['PATH']
 
 # Caddy configuration templates
 
@@ -103,7 +103,7 @@ $SITE_NAME {
   
   # Add headers
   header {
-    X-Deployed-By Piku
+    X-Deployed-By kata
   }
   
   # Enable gzip compression
@@ -172,7 +172,7 @@ CADDY_CLOUDFLARE_CONFIG = """
 
 SYSTEMD_APP_TEMPLATE = """
 [Unit]
-Description=Piku app: {app_name} - {process_type} {instance}
+Description=Kata app: {app_name} - {process_type} {instance}
 After=network.target
 
 [Service]
@@ -192,35 +192,170 @@ SyslogIdentifier={app_name}-{process_type}-{instance}
 WantedBy=multi-user.target
 """
 
-SYSTEMD_PODMAN_TEMPLATE = """
-[Unit]
-Description=Piku app: {app_name} (containerized)
-After=network.target
+# Podman Quadlet template
+QUADLET_CONTAINER_TEMPLATE = """
+[Container]
+Image={image}
+ContainerName={container_name}
+PublishPort={host_port}:{container_port}
+Volume={app_path}:/app
+Volume={data_path}:/data
+{extra_volumes}
+{extra_environment}
+{command_section}
 
 [Service]
-User={user}
-Group={group}
-WorkingDirectory={app_path}
-Environment="PORT={port}"
-{environment_vars}
-ExecStartPre=/usr/bin/podman pull {image}
-ExecStart=/usr/bin/podman run --rm --name={container_name} \\
-    -p {host_port}:{container_port} \\
-    -v {app_path}:/app \\
-    -v {data_path}:/data \\
-    {volume_mounts} \\
-    {env_args} \\
-    {image} {command}
-ExecStop=/usr/bin/podman stop -t 10 {container_name}
-Restart=always
-RestartSec=10
 StandardOutput=append:{log_path}
 StandardError=append:{log_path}
 SyslogIdentifier={app_name}-container
+Restart=always
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
 """
+
+# Systemd timer template for cron jobs
+SYSTEMD_TIMER_TEMPLATE = """
+[Unit]
+Description=Timer for Kata app: {app_name} - {process_type}
+
+[Timer]
+OnCalendar={calendar_spec}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
+# === Simplified CLI decorators ===
+
+# Registry for commands and arguments
+_commands = {}
+_arguments = {}
+
+def command(name):
+    """Register a function as a CLI command"""
+    def decorator(f):
+        _commands[name] = {
+            "name": name,
+            "func": f,
+            "doc": f.__doc__
+        }
+        return f
+    return decorator
+
+def argument(name, nargs=1):
+    """Add an argument to a command"""
+    def decorator(f):
+        if f.__name__ not in _arguments:
+            _arguments[f.__name__] = []
+        
+        _arguments[f.__name__].append({
+            "name": name,
+            "nargs": nargs
+        })
+        return f
+    
+    return decorator
+
+def pass_context(f):
+    """Mark a function as requiring context"""
+    f._pass_context = True
+    return f
+
+def echo(message, fg=None, nl=True, err=False):
+    """Print a message with optional color"""
+    color_map = {
+        'green': '\033[92m',
+        'red': '\033[91m',
+        'yellow': '\033[93m',
+        'white': '\033[97m',
+    }
+    reset = '\033[0m'
+    
+    output_stream = stderr if err else stdout
+    
+    if fg and fg in color_map:
+        print(f"{color_map[fg]}{message}{reset}", end='\n' if nl else '', file=output_stream, flush=True)
+    else:
+        print(message, end='\n' if nl else '', file=output_stream, flush=True)
+
+class Context(dict):
+    """Simple context dict for commands that need it"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+    
+    def get_help(self):
+        """Get help information"""
+        return "The smallest PaaS you've ever seen"
+
+def show_help():
+    """Show help for all commands"""
+    # Get program description
+    echo("Kata: The smallest PaaS you've ever seen", fg="green")
+    
+    echo("\nCommands:", fg="green")
+    for cmd_name in sorted(_commands.keys()):
+        cmd_info = _commands[cmd_name]
+        cmd_help = (cmd_info["doc"] or "").split("\n")[0]
+        echo(f"  {cmd_name:<15} {cmd_help}", fg="white")
+    echo("")
+
+def run_cli():
+    """Run the CLI with arguments from sys.argv"""
+    args = argv[1:]
+    
+    # Show help if no command specified or help requested
+    if not args or args[0] in ('-h', '--help'):
+        show_help()
+        return 0
+    
+    cmd_name = args[0]
+    cmd_args = args[1:]
+    
+    if cmd_name in _commands:
+        command_func = _commands[cmd_name]["func"]
+        
+        # Parse arguments
+        kwargs = {}
+        func_name = command_func.__name__
+        if func_name in _arguments:
+            arg_index = 0
+            for arg_meta in _arguments[func_name]:
+                arg_name = arg_meta["name"]
+                nargs = arg_meta["nargs"]
+                
+                if nargs == -1:  # Variable arguments
+                    kwargs[arg_name] = cmd_args[arg_index:]
+                    break
+                elif nargs == 1:  # Single argument
+                    if arg_index < len(cmd_args):
+                        kwargs[arg_name] = cmd_args[arg_index]
+                        arg_index += 1
+                else:  # Multiple arguments
+                    values = []
+                    for _ in range(nargs):
+                        if arg_index < len(cmd_args):
+                            values.append(cmd_args[arg_index])
+                            arg_index += 1
+                    kwargs[arg_name] = values
+        
+        # Create context for commands that require it
+        ctx = Context(command=func_name, args=cmd_args)
+        
+        try:
+            if hasattr(command_func, '_pass_context'):
+                return command_func(ctx, **kwargs) or 0
+            else:
+                return command_func(**kwargs) or 0
+        except Exception as e:
+            echo(f"Error: {str(e)}", fg="red", err=True)
+            return 1
+    
+    echo(f"Error: Command '{cmd_name}' not found", fg="red", err=True)
+    show_help()
+    return 1
 
 # === Utility functions ===
 
@@ -386,9 +521,7 @@ def do_deploy(app, deltas={}, newrev=None):
             # Detect application type and deploy
             if exists(join(app_path, 'requirements.txt')) and found_app("Python"):
                 settings.update(deploy_python(app, deltas))
-            elif exists(join(app_path, 'pyproject.toml')) and which('poetry') and found_app("Python"):
-                settings.update(deploy_python_with_poetry(app, deltas))
-            elif exists(join(app_path, 'pyproject.toml')) and which('uv') and found_app("Python (uv)"):
+            elif exists(join(app_path, 'pyproject.toml')) and (exists(join(app_path, 'uv.lock')) or exists(join(app_path, '.uv'))) and which('uv') and found_app("Python (uv)"):
                 settings.update(deploy_python_with_uv(app, deltas))
             elif exists(join(app_path, 'Dockerfile')) and found_app("Containerized") and check_requirements(['podman']):
                 settings.update(deploy_containerized(app, deltas))
@@ -448,41 +581,6 @@ def deploy_python(app, deltas={}):
     return spawn_app(app, deltas)
 
 
-def deploy_python_with_poetry(app, deltas={}):
-    """Deploy a Python application using Poetry"""
-
-    echo("=====> Starting poetry deployment for '{}'".format(app), fg='green')
-    virtualenv_path = join(ENV_ROOT, app)
-    requirements = join(APP_ROOT, app, 'pyproject.toml')
-    env_file = join(APP_ROOT, app, 'ENV')
-    symlink_path = join(APP_ROOT, app, '.venv')
-    if not exists(symlink_path):
-        echo("-----> Creating .venv symlink '{}'".format(app), fg='green')
-        symlink(virtualenv_path, symlink_path, target_is_directory=True)
-    # Set unbuffered output and readable UTF-8 mapping
-    env = {
-        **environ,
-        'POETRY_VIRTUALENVS_IN_PROJECT': '1',
-        'PYTHONUNBUFFERED': '1',
-        'PYTHONIOENCODING': 'UTF_8:replace'
-    }
-    if exists(env_file):
-        env.update(parse_settings(env_file, env))
-
-    first_time = False
-    if not exists(join(virtualenv_path, "bin", "activate")):
-        echo("-----> Creating virtualenv for '{}'".format(app), fg='green')
-        try:
-            makedirs(virtualenv_path)
-        except FileExistsError:
-            echo("-----> Env dir already exists: '{}'".format(app), fg='yellow')
-        first_time = True
-
-    if first_time or getmtime(requirements) > getmtime(virtualenv_path):
-        echo("-----> Running poetry for '{}'".format(app), fg='green')
-        call('poetry install', cwd=join(APP_ROOT, app), env=env, shell=True)
-
-    return spawn_app(app, deltas)
 
 
 def deploy_python_with_uv(app, deltas={}):
@@ -508,7 +606,7 @@ def deploy_python_with_uv(app, deltas={}):
 
 
 def deploy_containerized(app, deltas={}):
-    """Deploy a containerized application using Podman"""
+    """Deploy a containerized application using Podman Quadlets"""
     
     app_path = join(APP_ROOT, app)
     env_file = join(APP_ROOT, app, 'ENV')
@@ -519,6 +617,13 @@ def deploy_containerized(app, deltas={}):
     
     echo("-----> Building container for '{}'".format(app), fg='green')
     call('podman build -t {app:s} .'.format(**locals()), cwd=app_path, shell=True)
+    
+    # Ensure quadlet directory exists
+    podman_dir = join(PODMAN_ROOT, app)
+    if not exists(podman_dir):
+        makedirs(podman_dir)
+    
+    echo("-----> Setting up Podman Quadlet configuration for '{}'".format(app), fg='green')
     
     return spawn_app(app, deltas)
 
@@ -763,9 +868,27 @@ def spawn_app(app, deltas={}):
                 echo("-----> Spawning '{app:s}:{k:s}.{w:d}'".format(**locals()), fg='green')
                 spawn_worker(app, k, workers[k], env, w, unit_file)
                 
+                # If it's a container file, we need special handling for quadlet
+                is_container = unit_file.endswith('.container')
+                
+                # Create quadlet directory if needed
+                quadlet_dir = join(user_systemd_dir, 'containers', 'systemd')
+                if is_container and not exists(quadlet_dir):
+                    makedirs(quadlet_dir, exist_ok=True)
+                
+                # Use appropriate destination for symlink
+                symlink_dest = unit_file
+                symlink_target = unit_link if not is_container else join(quadlet_dir, basename(unit_file))
+                
                 # Create symlink to user systemd directory if it doesn't exist
-                if not exists(unit_link):
-                    symlink(unit_file, unit_link)
+                if not exists(symlink_target):
+                    symlink(symlink_dest, symlink_target)
+                
+                # For container files, we need to run daemon-reload to generate the service
+                if is_container:
+                    call('systemctl --user daemon-reload', shell=True)
+                    # The actual service name is generated by podman
+                    unit_name = basename(unit_file).replace('.container', '.service')
                 
                 # Enable and start the service
                 call('systemctl --user enable {}'.format(unit_name), shell=True)
@@ -785,10 +908,26 @@ def spawn_app(app, deltas={}):
                 call('systemctl --user stop {}'.format(unit_name), shell=True)
                 call('systemctl --user disable {}'.format(unit_name), shell=True)
                 
-                # Remove the symlink and unit file
+                # Check if this is a container file
+            is_container = unit_file.endswith('.service') and exists(unit_file.replace('.service', '.container'))
+            
+            if is_container:
+                container_file = unit_file.replace('.service', '.container')
+                quadlet_link = join(environ['HOME'], '.config/systemd/user/containers/systemd', basename(container_file))
+                
+                # Remove the quadlet file and symlink
+                if exists(quadlet_link):
+                    unlink(quadlet_link)
+                if exists(container_file):
+                    unlink(container_file)
+                # Run daemon-reload to update systemd
+                call('systemctl --user daemon-reload', shell=True)
+            else:
+                # Remove the regular symlink and unit file
                 if exists(unit_link):
                     unlink(unit_link)
-                unlink(unit_file)
+                if exists(unit_file):
+                    unlink(unit_file)
 
     return env
 
@@ -833,25 +972,29 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
         
         # Convert cron pattern to systemd timer format
         # This is a simplified conversion and might need enhancement for complex patterns
-        systemd_calendar = ''
-        if weekday != '*':
-            systemd_calendar += 'Sat' if weekday == '6' else 'Sun' if weekday == '0' else 'Mon' if weekday == '1' else 'Tue' if weekday == '2' else 'Wed' if weekday == '3' else 'Thu' if weekday == '4' else 'Fri'
-        else:
-            systemd_calendar += '*'
+        # Build the systemd calendar specification string using f-strings
+        weekday_str = ('Sat' if weekday == '6' else 
+                       'Sun' if weekday == '0' else 
+                       'Mon' if weekday == '1' else 
+                       'Tue' if weekday == '2' else 
+                       'Wed' if weekday == '3' else 
+                       'Thu' if weekday == '4' else 
+                       'Fri' if weekday == '5' else '*')
         
-        systemd_calendar += ' ' + (month if month != '*' else '*')
-        systemd_calendar += ' ' + (day if day != '*' else '*')
-        systemd_calendar += ' ' + (hour if hour != '*' else '*')
-        systemd_calendar += ' ' + (minute if minute != '*' else '*')
+        month_str = month if month != '*' else '*'
+        day_str = day if day != '*' else '*'
+        hour_str = hour if hour != '*' else '*'
+        minute_str = minute if minute != '*' else '*'
         
-        # Create the timer unit
-        timer_content = "[Unit]\n"
-        timer_content += "Description=Timer for Piku app: {app} - {kind}\n\n".format(**locals())
-        timer_content += "[Timer]\n"
-        timer_content += "OnCalendar={}\n".format(systemd_calendar)
-        timer_content += "Persistent=true\n\n"
-        timer_content += "[Install]\n"
-        timer_content += "WantedBy=timers.target\n"
+        # Format the calendar specification using f-strings
+        calendar_spec = f"{weekday_str} {month_str} {day_str} {hour_str} {minute_str}"
+        
+        # Format the timer content using the template
+        timer_content = SYSTEMD_TIMER_TEMPLATE.format(
+            app_name=app,
+            process_type=kind,
+            calendar_spec=calendar_spec
+        )
         
         with open(timer_unit, 'w') as f:
             f.write(timer_content)
@@ -865,45 +1008,54 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
     # Create systemd unit file
     unit_content = ''
     if containerized:
-        # For containerized applications
-        container_name = "{app}-{kind}-{ordinal}".format(**locals())
+        # For containerized applications, use Podman Quadlet configuration
+        container_name = f"{app}-{kind}-{ordinal}"
         image = app
         host_port = env.get('PORT', '8000')
         container_port = env.get('CONTAINER_PORT', host_port)
+        app_name = app
         
-        # Parse any additional volume mounts
-        volume_mounts = ''
+        # Create a .container file for quadlet instead of a direct systemd unit
+        quadlet_file = unit_file.replace('.service', '.container')
+        
+        # Process additional volume mounts from environment
+        extra_volumes = ""
+        extra_environment = ""
+        command_section = ""
+        
         for key, value in env.items():
             if key.startswith('VOLUME_'):
-                volume_mounts += '-v {}:{} \\\n    '.format(value.split(':')[0], value.split(':')[1])
+                src, dest = value.split(':')
+                extra_volumes += f"Volume={src}:{dest}\n"
+            elif not key.startswith('VOLUME_') and key != 'PORT' and key != 'CONTAINER_PORT':
+                extra_environment += f'Environment="{key}={value}"\n'
         
-        # Create environment arguments for docker run
-        env_args = ''
-        for key, value in env.items():
-            if not key.startswith('VOLUME_') and key != 'PORT' and key != 'CONTAINER_PORT':
-                env_args += '-e {}="{}" \\\n    '.format(key, value)
+        # Add command if specified
+        if command and command.strip():
+            command_section = f"Exec={command}"
         
-        # Format the environment variables for systemd
-        environment_vars = '\n'.join(['Environment="{}={}"'.format(k, v) for k, v in env.items() 
-                                     if not k.startswith('VOLUME_') and k != 'PORT' and k != 'CONTAINER_PORT'])
-        
-        unit_content = SYSTEMD_PODMAN_TEMPLATE.format(
-            app_name=app,
-            user=getpwuid(getuid()).pw_name,
-            group=getgrgid(getgid()).gr_name,
-            app_path=app_path,
-            data_path=data_path,
-            port=env.get('PORT', '8000'),
-            environment_vars=environment_vars,
+        # Format quadlet content using the template
+        quadlet_content = QUADLET_CONTAINER_TEMPLATE.format(
             image=image,
             container_name=container_name,
             host_port=host_port,
             container_port=container_port,
-            volume_mounts=volume_mounts,
-            env_args=env_args,
+            app_path=app_path,
+            data_path=data_path,
+            extra_volumes=extra_volumes.strip(),
+            extra_environment=extra_environment.strip(),
+            command_section=command_section,
             log_path=log_file,
-            command=command
+            app_name=app_name
         )
+        
+        # Write the quadlet file
+        with open(quadlet_file, 'w') as f:
+            f.write(quadlet_content)
+        
+        # Change the unit_file to point to the quadlet file
+        # The actual .service will be generated by the podman-systemd generator
+        unit_file = quadlet_file
     else:
         # For regular applications
         # Format the environment variables for systemd
@@ -931,12 +1083,18 @@ def do_stop(app):
     """Stop an app by disabling its systemd services"""
     app = sanitize_app_name(app)
     user_systemd_dir = join(environ['HOME'], '.config', 'systemd', 'user')
+    quadlet_dir = join(user_systemd_dir, 'containers', 'systemd')
     
-    # Find all systemd units for this app
+    # Find all systemd units for this app (standard units)
     units = glob(join(SYSTEMD_ROOT, '{}*.service'.format(app)))
     
-    if len(units) > 0:
+    # Also find all quadlet .container files
+    container_files = glob(join(SYSTEMD_ROOT, '{}*.container'.format(app)))
+    
+    if len(units) > 0 or len(container_files) > 0:
         echo("Stopping app '{}'...".format(app), fg='yellow')
+        
+        # Handle standard service units
         for unit in units:
             unit_name = basename(unit)
             # Stop and disable the service
@@ -947,6 +1105,23 @@ def do_stop(app):
             unit_link = join(user_systemd_dir, unit_name)
             if exists(unit_link):
                 unlink(unit_link)
+        
+        # Handle quadlet container files
+        for container_file in container_files:
+            container_name = basename(container_file)
+            service_name = container_name.replace('.container', '.service')
+            
+            # Stop and disable the service
+            call('systemctl --user stop {}'.format(service_name), shell=True)
+            call('systemctl --user disable {}'.format(service_name), shell=True)
+            
+            # Remove symlink from quadlet directory
+            quadlet_link = join(quadlet_dir, container_name)
+            if exists(quadlet_link):
+                unlink(quadlet_link)
+            
+            # Run daemon-reload to update systemd
+            call('systemctl --user daemon-reload', shell=True)
     else:
         echo("Error: app '{}' not deployed or already stopped!".format(app), fg='red')
 
@@ -959,12 +1134,23 @@ def do_restart(app):
     # Find all systemd units for this app
     units = glob(join(SYSTEMD_ROOT, '{}*.service'.format(app)))
     
-    if len(units) > 0:
+    # Also find all quadlet .container files
+    container_files = glob(join(SYSTEMD_ROOT, '{}*.container'.format(app)))
+    
+    if len(units) > 0 or len(container_files) > 0:
         echo("Restarting app '{}'...".format(app), fg='yellow')
+        
+        # Handle standard service units
         for unit in units:
             unit_name = basename(unit)
             # Restart the service
             call('systemctl --user restart {}'.format(unit_name), shell=True)
+        
+        # Handle quadlet container files
+        for container_file in container_files:
+            service_name = basename(container_file).replace('.container', '.service')
+            # Restart the service
+            call('systemctl --user restart {}'.format(service_name), shell=True)
     else:
         echo("Error: app '{}' not deployed!".format(app), fg='red')
         # Try to deploy it
@@ -1027,26 +1213,11 @@ def multi_tail(app, filenames, catch_up=20):
 CONTEXT_SETTINGS = dict(help_option_names=['-h', '--help'])
 
 
-@group(context_settings=CONTEXT_SETTINGS)
-def piku():
-    """The smallest PaaS you've ever seen"""
-    pass
-
-
-piku.rc = getattr(piku, "result_callback", None) or getattr(piku, "resultcallback", None)
-
-
-@piku.rc()
-def cleanup(ctx):
-    """Callback from command execution -- add debugging to taste"""
-    pass
-
 # --- User commands ---
 
-
-@piku.command("apps")
+@command("apps")
 def cmd_apps():
-    """List apps, e.g.: piku apps"""
+    """List apps, e.g.: kata apps"""
     apps = listdir(APP_ROOT)
     if not apps:
         echo("There are no applications deployed.")
@@ -1058,10 +1229,10 @@ def cmd_apps():
         echo(('*' if running else ' ') + a, fg='green')
 
 
-@piku.command("config")
+@command("config")
 @argument('app')
 def cmd_config(app):
-    """Show config, e.g.: piku config <app>"""
+    """Show config, e.g.: kata config <app>"""
 
     app = exit_if_invalid(app)
 
@@ -1072,11 +1243,11 @@ def cmd_config(app):
         echo("Warning: app '{}' not deployed, no config found.".format(app), fg='yellow')
 
 
-@piku.command("config:get")
+@command("config:get")
 @argument('app')
 @argument('setting')
 def cmd_config_get(app, setting):
-    """e.g.: piku config:get <app> FOO"""
+    """e.g.: kata config:get <app> FOO"""
 
     app = exit_if_invalid(app)
 
@@ -1089,11 +1260,11 @@ def cmd_config_get(app, setting):
         echo("Warning: no active configuration for '{}'".format(app))
 
 
-@piku.command("config:set")
+@command("config:set")
 @argument('app')
 @argument('settings', nargs=-1)
 def cmd_config_set(app, settings):
-    """e.g.: piku config:set <app> FOO=bar BAZ=quux"""
+    """e.g.: kata config:set <app> FOO=bar BAZ=quux"""
 
     app = exit_if_invalid(app)
 
@@ -1111,11 +1282,11 @@ def cmd_config_set(app, settings):
     do_deploy(app)
 
 
-@piku.command("config:unset")
+@command("config:unset")
 @argument('app')
 @argument('settings', nargs=-1)
 def cmd_config_unset(app, settings):
-    """e.g.: piku config:unset <app> FOO"""
+    """e.g.: kata config:unset <app> FOO"""
 
     app = exit_if_invalid(app)
 
@@ -1129,10 +1300,10 @@ def cmd_config_unset(app, settings):
     do_deploy(app)
 
 
-@piku.command("config:live")
+@command("config:live")
 @argument('app')
 def cmd_config_live(app):
-    """e.g.: piku config:live <app>"""
+    """e.g.: kata config:live <app>"""
 
     app = exit_if_invalid(app)
 
@@ -1143,19 +1314,19 @@ def cmd_config_live(app):
         echo("Warning: app '{}' not deployed, no config found.".format(app), fg='yellow')
 
 
-@piku.command("deploy")
+@command("deploy")
 @argument('app')
 def cmd_deploy(app):
-    """e.g.: piku deploy <app>"""
+    """e.g.: kata deploy <app>"""
 
     app = exit_if_invalid(app)
     do_deploy(app)
 
 
-@piku.command("destroy")
+@command("destroy")
 @argument('app')
 def cmd_destroy(app):
-    """e.g.: piku destroy <app>"""
+    """e.g.: kata destroy <app>"""
 
     app = exit_if_invalid(app)
 
@@ -1186,11 +1357,11 @@ def cmd_destroy(app):
         call('systemctl reload caddy', shell=True)
 
 
-@piku.command("logs")
+@command("logs")
 @argument('app')
-@argument('process', nargs=1, default='*')
-def cmd_logs(app, process):
-    """Tail running logs, e.g: piku logs <app> [<process>]"""
+@argument('process', nargs=1)
+def cmd_logs(app, process='*'):
+    """Tail running logs, e.g: kata logs <app> [<process>]"""
 
     app = exit_if_invalid(app)
 
@@ -1202,10 +1373,10 @@ def cmd_logs(app, process):
         echo("No logs found for app '{}'.".format(app), fg='yellow')
 
 
-@piku.command("ps")
+@command("ps")
 @argument('app')
 def cmd_ps(app):
-    """Show process count, e.g: piku ps <app>"""
+    """Show process count, e.g: kata ps <app>"""
 
     app = exit_if_invalid(app)
 
@@ -1216,11 +1387,11 @@ def cmd_ps(app):
         echo("Error: no workers found for app '{}'.".format(app), fg='red')
 
 
-@piku.command("ps:scale")
+@command("ps:scale")
 @argument('app')
 @argument('settings', nargs=-1)
 def cmd_ps_scale(app, settings):
-    """e.g.: piku ps:scale <app> <proc>=<count>"""
+    """e.g.: kata ps:scale <app> <proc>=<count>"""
 
     app = exit_if_invalid(app)
 
@@ -1244,11 +1415,11 @@ def cmd_ps_scale(app, settings):
     do_deploy(app, deltas)
 
 
-@piku.command("run")
+@command("run")
 @argument('app')
 @argument('cmd', nargs=-1)
 def cmd_run(app, cmd):
-    """e.g.: piku run <app> ls -- -al"""
+    """e.g.: kata run <app> ls -- -al"""
 
     app = exit_if_invalid(app)
 
@@ -1261,25 +1432,25 @@ def cmd_run(app, cmd):
     p.communicate()
 
 
-@piku.command("restart")
+@command("restart")
 @argument('app')
 def cmd_restart(app):
-    """Restart an app: piku restart <app>"""
+    """Restart an app: kata restart <app>"""
 
     app = exit_if_invalid(app)
 
     do_restart(app)
 
 
-@piku.command("stop")
+@command("stop")
 @argument('app')
 def cmd_stop(app):
-    """Stop an app, e.g: piku stop <app>"""
+    """Stop an app, e.g: kata stop <app>"""
     app = exit_if_invalid(app)
     do_stop(app)
 
 
-@piku.command("setup")
+@command("setup")
 def cmd_setup():
     """Initialize environment"""
 
@@ -1296,9 +1467,15 @@ def cmd_setup():
     if not exists(user_systemd_dir):
         echo("Creating '{}'.".format(user_systemd_dir), fg='green')
         makedirs(user_systemd_dir)
+    
+    # Create systemd user quadlet directory
+    quadlet_dir = join(user_systemd_dir, 'containers', 'systemd')
+    if not exists(quadlet_dir):
+        echo("Creating quadlet directory '{}'.".format(quadlet_dir), fg='green')
+        makedirs(quadlet_dir)
 
     # Check for required binaries
-    requirements = ['caddy', 'podman', 'systemctl']
+    requirements = ['caddy', 'podman', 'podman-compose']
     missing = []
     for req in requirements:
         if not which(req):
@@ -1306,15 +1483,28 @@ def cmd_setup():
     
     if missing:
         echo("Warning: Missing required binaries: {}".format(', '.join(missing)), fg='yellow')
-        echo("You'll need to install these packages before using Piku", fg='yellow')
+        echo("You'll need to install these packages before using Kata", fg='yellow')
+        
+    # Verify podman-system-generator is available for quadlet integration
+    podman_generator = False
+    for path in ['/usr/lib/systemd/system-generators/podman-system-generator', 
+                 '/usr/local/lib/systemd/system-generators/podman-system-generator']:
+        if exists(path):
+            podman_generator = True
+            break
+    
+    if not podman_generator:
+        echo("Warning: podman-system-generator not found.", fg='yellow')
+        echo("Container quadlet functionality may not work correctly.", fg='yellow')
+        echo("Make sure you have a recent version of podman with quadlet support.", fg='yellow')
 
     # mark this script as executable (in case we were invoked via interpreter)
-    if not (stat(PIKU_SCRIPT).st_mode & S_IXUSR):
-        echo("Setting '{}' as executable.".format(PIKU_SCRIPT), fg='yellow')
-        chmod(PIKU_SCRIPT, stat(PIKU_SCRIPT).st_mode | S_IXUSR)
+    if not (stat(KATA_SCRIPT).st_mode & S_IXUSR):
+        echo("Setting '{}' as executable.".format(KATA_SCRIPT), fg='yellow')
+        chmod(KATA_SCRIPT, stat(KATA_SCRIPT).st_mode | S_IXUSR)
 
 
-@piku.command("setup:ssh")
+@command("setup:ssh")
 @argument('public_key_file')
 def cmd_setup_ssh(public_key_file):
     """Set up a new SSH key (use - for stdin)"""
@@ -1325,7 +1515,7 @@ def cmd_setup_ssh(public_key_file):
                 fingerprint = str(check_output('ssh-keygen -lf ' + key_file, shell=True)).split(' ', 4)[1]
                 key = open(key_file, 'r').read().strip()
                 echo("Adding key '{}'.".format(fingerprint), fg='white')
-                setup_authorized_keys(fingerprint, PIKU_SCRIPT, key)
+                setup_authorized_keys(fingerprint, KATA_SCRIPT, key)
             except Exception:
                 echo("Error: invalid public key file '{}': {}".format(key_file, format_exc()), fg='red')
         elif public_key_file == '-':
@@ -1340,27 +1530,27 @@ def cmd_setup_ssh(public_key_file):
     add_helper(public_key_file)
 
 
-@piku.command("update")
+@command("update")
 def cmd_update():
-    """Update the piku cli"""
-    echo("Updating piku...")
+    """Update the kata cli"""
+    echo("Updating kata...")
 
     with NamedTemporaryFile(mode="w") as f:
         tempfile = f.name
-        cmd = """curl -sL -w %{{http_code}} {} -o {}""".format(PIKU_RAW_SOURCE_URL, tempfile)
+        cmd = """curl -sL -w %{{http_code}} {} -o {}""".format(KATA_RAW_SOURCE_URL, tempfile)
         response = check_output(cmd.split(' '), stderr=STDOUT)
         http_code = response.decode('utf8').strip()
         if http_code == "200":
-            copyfile(tempfile, PIKU_SCRIPT)
+            copyfile(tempfile, KATA_SCRIPT)
             echo("Update successful.")
         else:
-            echo("Error updating piku - please check if {} is accessible from this machine.".format(PIKU_RAW_SOURCE_URL))
+            echo("Error updating kata - please check if {} is accessible from this machine.".format(KATA_RAW_SOURCE_URL))
     echo("Done.")
 
 
 # --- Internal commands ---
 
-@piku.command("git-hook")
+@command("git-hook")
 @argument('app')
 def cmd_git_hook(app):
     """INTERNAL: Post-receive git hook"""
@@ -1384,7 +1574,7 @@ def cmd_git_hook(app):
         do_deploy(app, newrev=newrev)
 
 
-@piku.command("git-receive-pack")
+@command("git-receive-pack")
 @argument('app')
 def cmd_git_receive_pack(app):
     """INTERNAL: Handle git pushes for an app"""
@@ -1401,14 +1591,14 @@ def cmd_git_receive_pack(app):
         with open(hook_path, 'w') as h:
             h.write("""#!/usr/bin/env bash
 set -e; set -o pipefail;
-cat | PIKU_ROOT="{PIKU_ROOT:s}" {PIKU_SCRIPT:s} git-hook {app:s}""".format(**env))
+cat | KATA_ROOT="{KATA_ROOT:s}" {KATA_SCRIPT:s} git-hook {app:s}""".format(**env))
         # Make the hook executable by our user
         chmod(hook_path, stat(hook_path).st_mode | S_IXUSR)
     # Handle the actual receive. We'll be called with 'git-hook' after it happens
     call('git-shell -c "{}" '.format(argv[1] + " '{}'".format(app)), cwd=GIT_ROOT, shell=True)
 
 
-@piku.command("git-upload-pack")
+@command("git-upload-pack")
 @argument('app')
 def cmd_git_upload_pack(app):
     """INTERNAL: Handle git upload pack for an app"""
@@ -1419,40 +1609,19 @@ def cmd_git_upload_pack(app):
     call('git-shell -c "{}" '.format(argv[1] + " '{}'".format(app)), cwd=GIT_ROOT, shell=True)
 
 
-@piku.command("scp", context_settings=dict(ignore_unknown_options=True, allow_extra_args=True))
+@command("scp")
 @pass_context
 def cmd_scp(ctx):
     """Simple wrapper to allow scp to work."""
-    call(" ".join(["scp"] + ctx.args), cwd=GIT_ROOT, shell=True)
+    call(" ".join(["scp"] + ctx["args"]), cwd=GIT_ROOT, shell=True)
 
 
-@piku.command("help")
-@pass_context
-def cmd_help(ctx):
-    """display help for piku"""
-    echo(ctx.parent.get_help())
-
-
-def _get_plugin_commands(path):
-    sys_path.append(abspath(path))
-
-    cli_commands = []
-    if isdir(path):
-        for item in listdir(path):
-            module_path = join(path, item)
-            if isdir(module_path):
-                try:
-                    module = import_module(item)
-                except Exception:
-                    module = None
-                if hasattr(module, 'cli_commands'):
-                    cli_commands.append(module.cli_commands())
-
-    return cli_commands
+@command("help")
+def cmd_help():
+    """display help for kata"""
+    show_help()
 
 
 if __name__ == '__main__':
-    cli_commands = _get_plugin_commands(path=PIKU_PLUGIN_ROOT)
-    cli_commands.append(piku)
-    cli = CommandCollection(sources=cli_commands)
-    cli()
+    # Run the CLI with all registered commands
+    run_cli()

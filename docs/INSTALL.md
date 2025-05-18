@@ -70,7 +70,7 @@ sudo pip3 install podman-compose
 1.  **Download `kata.py`:**
     Obtain the `kata.py` script. You can download it directly from its source repository or copy it to your server. For example:
     ```bash
-    curl -o kata.py https://raw.githubusercontent.com/piku/piku/master/kata.py # Replace with the correct URL if different
+    curl -o kata.py https://raw.githubusercontent.com/piku/kata/master/kata.py # Replace with the correct URL if different
     ```
 
 2.  **Make it Executable:**
