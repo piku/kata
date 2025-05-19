@@ -42,7 +42,7 @@ if '.local' not in environ['PATH']:
 # === Globals - all tweakable settings are here ===
 
 KATA_RAW_SOURCE_URL = "https://raw.githubusercontent.com/piku/kata/main/refactor/kata.py"
-KATA_ROOT = environ.get('KATA_ROOT', join(environ['HOME'], '.piku'))
+KATA_ROOT = environ.get('KATA_ROOT', join(environ['HOME'], '.kata'))
 KATA_BIN = join(environ['HOME'], 'bin')
 KATA_SCRIPT = realpath(__file__)
 KATA_PLUGIN_ROOT = abspath(join(KATA_ROOT, "plugins"))
@@ -519,15 +519,33 @@ def do_deploy(app, deltas={}, newrev=None):
                 workers.pop("preflight", None)
                 
             # Detect application type and deploy
+            static_check_keys = set(workers.keys()) - {"preflight", "release"}
+            deployed = False
             if exists(join(app_path, 'requirements.txt')) and found_app("Python"):
                 settings.update(deploy_python(app, deltas))
+                deployed = True
             elif exists(join(app_path, 'pyproject.toml')) and (exists(join(app_path, 'uv.lock')) or exists(join(app_path, '.uv'))) and which('uv') and found_app("Python (uv)"):
                 settings.update(deploy_python_with_uv(app, deltas))
+                deployed = True
             elif exists(join(app_path, 'Dockerfile')) and found_app("Containerized") and check_requirements(['podman']):
                 settings.update(deploy_containerized(app, deltas))
+                deployed = True
             elif exists(join(app_path, 'docker-compose.yaml')) and found_app("Docker Compose") and check_requirements(['podman-compose']):
                 settings.update(deploy_compose(app, deltas))
-            else:
+                deployed = True
+            elif (
+                # Only static worker(s) present (allow preflight/release)
+                len(static_check_keys) > 0 and all(k == "static" for k in static_check_keys)
+                and found_app("Static")
+            ):
+                # Only static worker(s) present
+                settings.update(spawn_app(app, deltas))
+                deployed = True
+            # If static worker is present, always (re)generate Caddy config for static assets
+            if 'static' in workers and not deployed:
+                settings.update(spawn_app(app, deltas))
+                deployed = True
+            if not deployed:
                 echo("-----> Could not detect runtime!", fg='red')
                 echo("-----> Only Python and containerized apps are currently supported.", fg='yellow')
             
@@ -573,7 +591,7 @@ def deploy_python(app, deltas={}):
         first_time = True
 
     activation_script = join(virtualenv_path, 'bin', 'activate_this.py')
-    exec(open(activation_script).read(), dict(__file__=activation_script))
+    exec(open(activation_script).red(), dict(__file__=activation_script))
 
     if first_time or getmtime(requirements) > getmtime(virtualenv_path):
         echo("-----> Running pip for '{}'".format(app), fg='green')
@@ -691,6 +709,7 @@ def spawn_app(app, deltas={}):
         env.update(parse_settings(settings, env))
 
     if 'web' in workers or 'wsgi' in workers or 'static' in workers:
+        echo("-----> Generating Caddy configuration", fg='green')
         # Pick a port if none defined
         if 'PORT' not in env:
             env['PORT'] = str(get_free_port())
@@ -846,6 +865,10 @@ def spawn_app(app, deltas={}):
             worker_count[k] = worker_count[k] + deltas[k]
 
     # Save current settings
+    # Ensure the directory for LIVE_ENV exists before writing
+    live_dir = dirname(live)
+    if not exists(live_dir):
+        makedirs(live_dir)
     write_config(live, env)
     write_config(scaling, worker_count, ':')
 
@@ -961,7 +984,7 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
         # Web workers run as-is
         pass
     elif kind == 'static':
-        # Static workers don't need a systemd unit
+        # Static workers don't need a systemd unit, skip creation
         return
     elif kind.startswith('cron'):
         # For cron-like jobs, use systemd timer instead of service
