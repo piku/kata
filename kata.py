@@ -66,6 +66,7 @@ if KATA_BIN not in environ['PATH']:
     environ['PATH'] = KATA_BIN + ":" + environ['PATH']
 
 # Caddy configuration templates
+CADDY_MAINFILE_TEMPLATE = """# Main Caddyfile for Kata Micro-PaaS\nimport {import_path}\n"""
 
 CADDY_FILE_TEMPLATE = """
 {
@@ -599,8 +600,6 @@ def deploy_python(app, deltas={}):
     return spawn_app(app, deltas)
 
 
-
-
 def deploy_python_with_uv(app, deltas={}):
     """Deploy a Python application using Astral uv"""
 
@@ -882,6 +881,8 @@ def spawn_app(app, deltas={}):
 
     # Create new workers
     for k, v in to_create.items():
+        if k == "static":
+            continue  # Skip static workers for systemd unit/symlink creation
         for w in v:
             unit_name = "{app:s}_{k:s}.{w:d}".format(**locals())
             unit_file = join(SYSTEMD_ROOT, unit_name + '.service')
@@ -904,8 +905,13 @@ def spawn_app(app, deltas={}):
                 symlink_target = unit_link if not is_container else join(quadlet_dir, basename(unit_file))
                 
                 # Create symlink to user systemd directory if it doesn't exist
-                if not exists(symlink_target):
-                    symlink(symlink_dest, symlink_target)
+                if exists(symlink_target):
+                    try:
+                        unlink(symlink_target)
+                        echo(f"-----> Removed existing symlink: {symlink_target}", fg='yellow')
+                    except Exception as e:
+                        echo(f"Warning: Could not remove existing symlink {symlink_target}: {e}", fg='yellow')
+                symlink(symlink_dest, symlink_target)
                 
                 # For container files, we need to run daemon-reload to generate the service
                 if is_container:
@@ -1552,6 +1558,33 @@ def cmd_setup_ssh(public_key_file):
 
     add_helper(public_key_file)
 
+
+@command("setup:caddy")
+def cmd_setup_caddy():
+    """Set up the main Caddyfile to import all per-app .caddy files."""
+
+    caddy_import_path = join(environ['HOME'], ".kata", "caddy", "*.caddy")
+    main_caddyfile = CADDY_MAINFILE_TEMPLATE.format(import_path=caddy_import_path)
+
+    # Write reference copy to ~/.kata/Caddyfile
+    kata_caddyfile_path = join(environ["HOME"], ".kata", "Caddyfile")
+    makedirs(dirname(kata_caddyfile_path), exist_ok=True)
+    with open(kata_caddyfile_path, "w") as f:
+        f.write(main_caddyfile)
+
+    # Write to /etc/caddy/Caddyfile using sudo
+    try:
+        call(f"cp /etc/caddy/Caddyfile {KATA_ROOT}", shell=True)
+        with NamedTemporaryFile(mode="w") as f:
+            tempfile = f.name
+            with open(tempfile, "w") as f:
+                f.write(main_caddyfile)
+            call(f"sudo cp {tempfile} /etc/caddy/Caddyfile",  cwd=APP_ROOT, shell=True)
+        echo(f"Main Caddyfile installed to /etc/caddy/Caddyfile. Original file in {KATA_ROOT}.", fg='green')
+        echo("Please reload Caddy: sudo systemctl reload caddy")
+    except Exception as e:
+        echo(f"Error installing Caddyfile: {e}", fg='red')
+        
 
 @command("update")
 def cmd_update():
