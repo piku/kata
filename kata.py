@@ -12,6 +12,7 @@ from importlib import import_module
 from collections import defaultdict, deque
 from fcntl import fcntl, F_SETFL, F_GETFL
 from glob import glob
+from http.client import HTTPConnection
 from json import loads
 from multiprocessing import cpu_count
 from os import chmod, getgid, getuid, symlink, unlink, remove, stat, listdir, environ, makedirs, O_NONBLOCK
@@ -485,6 +486,22 @@ def check_requirements(binaries):
     return True
 
 
+def reload_caddy_admin():
+    """Reload Caddy config using the admin API (localhost:2019)."""
+    try:
+        conn = HTTPConnection('localhost', 2019, timeout=3)
+        conn.request('POST', '/load')
+        resp = conn.getresponse()
+        if resp.status == 200:
+            echo("-----> Reloaded Caddy configuration via admin API", fg='green')
+        else:
+            body = resp.read().decode(errors='replace')
+            echo(f"Warning: Caddy admin API reload failed: {resp.status} {resp.reason}\n{body}", fg='yellow')
+        conn.close()
+    except Exception as e:
+        echo(f"Warning: Could not reload Caddy via admin API: {e}", fg='yellow')
+
+
 def found_app(kind):
     """Helper function to output app detected"""
     echo("-----> {} app detected.".format(kind), fg='green')
@@ -717,13 +734,18 @@ def spawn_app(app, deltas={}):
         # Safe defaults for addressing
         for k, v in safe_defaults.items():
             if k not in env:
-                echo("-----> {k:s} will be set to {v}".format(**locals()))
                 env[k] = v
 
-        # Generate Caddy configuration if domain name is set
-        if 'CADDY_DOMAIN' in env:
+        # Generate Caddy configuration
+        caddy_file = join(CADDY_ROOT, "{}.caddy".format(app))
+        caddy_domain = env.get('CADDY_DOMAIN')
+        if not caddy_domain and 'static' in workers:
+            echo(f"Warning: No CADDY_DOMAIN set for static worker in app '{app}'. Defaulting to :{env['PORT']} (public HTTP only)", fg='yellow')
+            env['CADDY_DOMAIN'] = f':{env["PORT"]}'
+            caddy_domain = f':{env["PORT"]}'
+        if caddy_domain:
             # Ensure CADDY_DOMAIN is treated as a list
-            env['CADDY_DOMAIN'] = env['CADDY_DOMAIN'].split(',')
+            env['CADDY_DOMAIN'] = caddy_domain.split(',')
             env['CADDY_DOMAIN'] = ' '.join(env['CADDY_DOMAIN'])
 
             caddy_file = join(CADDY_ROOT, "{}.caddy".format(app))
@@ -842,13 +864,10 @@ def spawn_app(app, deltas={}):
             with open(caddy_file, 'w') as f:
                 f.write(caddy_config)
             
-            # Reload Caddy to apply the new configuration
-            if exists('/etc/systemd/system/caddy.service'):
-                echo("-----> Reloading Caddy configuration")
-                call('systemctl reload caddy', shell=True)
-            else:
-                echo("Warning: Caddy systemd service not found. Please reload Caddy manually.", fg='yellow')
-
+            echo("-----> Reloading Caddy configuration via admin API")
+            reload_caddy_admin()
+        else:
+            echo(f"Warning: No CADDY_DOMAIN set for app '{app}', and not a static worker. No Caddy config generated.", fg='yellow')
     # Configured worker count
     if exists(scaling):
         worker_count.update({k: int(v) for k, v in parse_procfile(scaling).items() if k in workers})
@@ -1676,7 +1695,6 @@ def cmd_scp(ctx):
 def cmd_help():
     """display help for kata"""
     show_help()
-
 
 if __name__ == '__main__':
     # Run the CLI with all registered commands
