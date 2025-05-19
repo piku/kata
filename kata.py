@@ -1579,7 +1579,7 @@ def cmd_setup_caddy():
             tempfile = f.name
             with open(tempfile, "w") as f:
                 f.write(main_caddyfile)
-            call(f"sudo cp {tempfile} /etc/caddy/Caddyfile",  cwd=APP_ROOT, shell=True)
+            call(f"sudo cp {tempfile} /etc/caddy/Caddyfile",  cwd=KATA_ROOT, shell=True)
         echo(f"Main Caddyfile installed to /etc/caddy/Caddyfile. Original file in {KATA_ROOT}.", fg='green')
         echo("Please reload Caddy: sudo systemctl reload caddy")
     except Exception as e:
