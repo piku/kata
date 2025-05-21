@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"Kata Micro-PaaS - Kata refactor"
+"Kata Micro-PaaS - Piku refactor"
 
 try:
     from sys import version_info
@@ -12,8 +12,9 @@ from importlib import import_module
 from collections import defaultdict, deque
 from fcntl import fcntl, F_SETFL, F_GETFL
 from glob import glob
-from http.client import HTTPConnection
-from json import loads
+from json import loads, dumps
+import http.client
+import os
 from multiprocessing import cpu_count
 from os import chmod, getgid, getuid, symlink, unlink, remove, stat, listdir, environ, makedirs, O_NONBLOCK
 from os.path import abspath, basename, dirname, exists, getmtime, join, realpath, splitext, isdir
@@ -53,6 +54,8 @@ ENV_ROOT = abspath(join(KATA_ROOT, "envs"))
 GIT_ROOT = abspath(join(KATA_ROOT, "repos"))
 LOG_ROOT = abspath(join(KATA_ROOT, "logs"))
 CADDY_ROOT = abspath(join(KATA_ROOT, "caddy"))
+CADDY_FILE = "/etc/caddy/Caddyfile"
+CADDY_API_ROOT = "http://localhost:2019/config"
 CACHE_ROOT = abspath(join(KATA_ROOT, "cache"))
 SYSTEMD_ROOT = abspath(join(KATA_ROOT, "systemd"))
 PODMAN_ROOT = abspath(join(KATA_ROOT, "podman"))
@@ -67,18 +70,23 @@ if KATA_BIN not in environ['PATH']:
     environ['PATH'] = KATA_BIN + ":" + environ['PATH']
 
 # Caddy configuration templates
-CADDY_MAINFILE_TEMPLATE = """# Main Caddyfile for Kata Micro-PaaS\nimport {import_path}\n"""
+CADDY_FILE = """
+{
+    debug
+    admin localhost:2019
+}
+"""
 
-CADDY_FILE_TEMPLATE = """
+CADDY_FILE_TEMPLATE_OLD = """
 {
   # Global options
   admin off
   persist_config off
-  
+
   # Default TLS settings
   auto_https $CADDY_AUTO_HTTPS
   email $CADDY_EMAIL
-  
+
   # HTTP options
   servers {
     protocol {
@@ -86,31 +94,28 @@ CADDY_FILE_TEMPLATE = """
     }
   }
 }
-
-# Site definitions
-$CADDY_SITES
 """
 
 CADDY_SITE_TEMPLATE = """
 $SITE_NAME {
   $TLS_CONFIG
-  
+
   $CLOUDFLARE_CONFIG
-  
+
   # Static file mappings
   $STATIC_MAPPINGS
-  
+
   # Proxy to application
   $PROXY_CONFIG
-  
+
   # Add headers
   header {
     X-Deployed-By kata
   }
-  
+
   # Enable gzip compression
   encode gzip
-  
+
   $CACHE_CONFIG
 }
 """
@@ -146,7 +151,7 @@ CADDY_PROXY_TEMPLATE = """
 CADDY_CACHE_TEMPLATE = """
   handle_path /$cache_prefixes {
     header Cache-Control "public, max-age=$cache_time_control"
-    
+
     reverse_proxy $APP_ADDRESS {
       header_up X-Forwarded-Proto {scheme}
       header_up X-Forwarded-For {remote}
@@ -160,11 +165,11 @@ CADDY_CLOUDFLARE_CONFIG = """
   @cloudflare_only {
     remote_ip $CLOUDFLARE_IPS
   }
-  
+
   handle @cloudflare_only {
     # Continue processing for CloudFlare IPs
   }
-  
+
   handle {
     abort
   }
@@ -239,11 +244,12 @@ _arguments = {}
 def command(name):
     """Register a function as a CLI command"""
     def decorator(f):
-        _commands[name] = {
-            "name": name,
-            "func": f,
-            "doc": f.__doc__
-        }
+        if f.__doc__:
+            _commands[name] = {
+                "name": name,
+                "func": f,
+                "doc": f.__doc__
+            }
         return f
     return decorator
 
@@ -252,13 +258,13 @@ def argument(name, nargs=1):
     def decorator(f):
         if f.__name__ not in _arguments:
             _arguments[f.__name__] = []
-        
+
         _arguments[f.__name__].append({
             "name": name,
             "nargs": nargs
         })
         return f
-    
+
     return decorator
 
 def pass_context(f):
@@ -275,9 +281,9 @@ def echo(message, fg=None, nl=True, err=False):
         'white': '\033[97m',
     }
     reset = '\033[0m'
-    
+
     output_stream = stderr if err else stdout
-    
+
     if fg and fg in color_map:
         print(f"{color_map[fg]}{message}{reset}", end='\n' if nl else '', file=output_stream, flush=True)
     else:
@@ -287,7 +293,7 @@ class Context(dict):
     """Simple context dict for commands that need it"""
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-    
+
     def get_help(self):
         """Get help information"""
         return "The smallest PaaS you've ever seen"
@@ -296,7 +302,7 @@ def show_help():
     """Show help for all commands"""
     # Get program description
     echo("Kata: The smallest PaaS you've ever seen", fg="green")
-    
+
     echo("\nCommands:", fg="green")
     for cmd_name in sorted(_commands.keys()):
         cmd_info = _commands[cmd_name]
@@ -307,18 +313,18 @@ def show_help():
 def run_cli():
     """Run the CLI with arguments from sys.argv"""
     args = argv[1:]
-    
+
     # Show help if no command specified or help requested
     if not args or args[0] in ('-h', '--help'):
         show_help()
         return 0
-    
+
     cmd_name = args[0]
     cmd_args = args[1:]
-    
+
     if cmd_name in _commands:
         command_func = _commands[cmd_name]["func"]
-        
+
         # Parse arguments
         kwargs = {}
         func_name = command_func.__name__
@@ -327,7 +333,7 @@ def run_cli():
             for arg_meta in _arguments[func_name]:
                 arg_name = arg_meta["name"]
                 nargs = arg_meta["nargs"]
-                
+
                 if nargs == -1:  # Variable arguments
                     kwargs[arg_name] = cmd_args[arg_index:]
                     break
@@ -342,10 +348,10 @@ def run_cli():
                             values.append(cmd_args[arg_index])
                             arg_index += 1
                     kwargs[arg_name] = values
-        
+
         # Create context for commands that require it
         ctx = Context(command=func_name, args=cmd_args)
-        
+
         try:
             if hasattr(command_func, '_pass_context'):
                 return command_func(ctx, **kwargs) or 0
@@ -354,10 +360,113 @@ def run_cli():
         except Exception as e:
             echo(f"Error: {str(e)}", fg="red", err=True)
             return 1
-    
+
     echo(f"Error: Command '{cmd_name}' not found", fg="red", err=True)
     show_help()
     return 1
+
+# === Caddy API Management ===
+
+def reload_caddy_admin():
+    """Reload Caddy config using the admin API (localhost:2019)"""
+    try:
+        conn = http.client.HTTPConnection('localhost', 2019, timeout=3)
+        conn.request('POST', '/load', headers={'Content-Type': 'application/json'})
+        resp = conn.getresponse()
+        if resp.status == 200:
+            echo("-----> Reloaded Caddy configuration via admin API", fg='green')
+        else:
+            body = resp.read().decode(errors='replace')
+            echo(f"Warning: Caddy admin API reload failed: {resp.status} {resp.reason}\n{body}", fg='yellow')
+        conn.close()
+    except Exception as e:
+        echo(f"Warning: Could not reload Caddy via admin API: {e}", fg='yellow')
+
+
+def load_caddy_json(app_path):
+    """Load the caddy.json file from the app directory if it exists"""
+    caddy_json_path = join(app_path, 'caddy.json')
+    if exists(caddy_json_path):
+        try:
+            with open(caddy_json_path, 'r') as f:
+                return loads(f.read())
+        except Exception as e:
+            echo(f"Error loading caddy.json for app: {e}", fg='red')
+    return None
+
+def expand_env_in_json(json_obj, env):
+    """Recursively substitute environment variables in JSON values"""
+    if isinstance(json_obj, dict):
+        return {k: expand_env_in_json(v, env) for k, v in json_obj.items()}
+    elif isinstance(json_obj, list):
+        return [expand_env_in_json(item, env) for item in json_obj]
+    elif isinstance(json_obj, str):
+        return expandvars(json_obj, env)
+    else:
+        return json_obj
+
+def configure_caddy_for_app(app, env):
+    """Configure Caddy for an app using the admin API"""
+    app = sanitize_app_name(app)
+    app_path = join(APP_ROOT, app)
+
+    # Load caddy.json from app directory
+    config_json = load_caddy_json(app_path)
+
+    # If no caddy.json found, return early
+    if not config_json:
+        echo(f"No caddy.json found for app '{app}', skipping Caddy configuration", fg='yellow')
+        return False
+
+    try:
+        config_json = expand_env_in_json(config_json, env)
+        config_data = dumps(config_json).encode('utf-8')
+        echo(f"-----> Configuring Caddy for app '{app}'", fg='green')
+        conn = http.client.HTTPConnection('localhost', 2019, timeout=5)
+        api_path = f"/config/apps/http/servers/{app}"
+        conn.request('PUT', api_path, body=config_data,
+                    headers={'Content-Type': 'application/json'})
+        resp = conn.getresponse()
+        body = resp.read().decode('utf-8', errors='replace')
+        if resp.status in (200, 201, 204):
+            echo(f"-----> Successfully configured Caddy for app '{app}'", fg='green')
+            return True
+        else:
+            echo(f"Warning: Caddy API configuration failed: {resp.status} {resp.reason}\n{body}", fg='yellow')
+            return False
+
+    except Exception as e:
+        echo(f"Error configuring Caddy for app '{app}': {e}", fg='red')
+        return False
+
+def remove_caddy_config_for_app(app):
+    """Remove Caddy configuration for an app using the admin API"""
+    app = sanitize_app_name(app)
+
+    try:
+        echo(f"-----> Removing Caddy configuration for app '{app}'", fg='yellow')
+        conn = http.client.HTTPConnection('localhost', 2019, timeout=5)
+
+        # Set the API path using the app name as the site ID
+        api_path = f"/config/apps/http/servers/{app}"
+
+        # Send DELETE request to Caddy API
+        conn.request('DELETE', api_path)
+
+        resp = conn.getresponse()
+        resp.read()  # Consume the response body
+
+        if resp.status in (200, 204):
+            echo(f"-----> Successfully removed Caddy configuration for app '{app}'", fg='green')
+            return True
+        else:
+            echo(f"Warning: Failed to remove Caddy config: {resp.status} {resp.reason}", fg='yellow')
+            return False
+
+    except Exception as e:
+        echo(f"Error removing Caddy configuration for app '{app}': {e}", fg='red')
+        return False
+
 
 # === Utility functions ===
 
@@ -422,6 +531,10 @@ def parse_procfile(filename):
                 continue
             try:
                 kind, command = map(lambda x: x.strip(), line.split(":", 1))
+                # Warn about deprecated worker types
+                if kind == 'wsgi':
+                    echo("Warning: 'wsgi' worker type is deprecated. Please use 'web' instead.", fg='yellow')
+                    kind = 'web'
                 # Check for cron patterns
                 if kind.startswith("cron"):
                     limits = [59, 24, 31, 12, 7]
@@ -485,22 +598,7 @@ def check_requirements(binaries):
         return False
     return True
 
-
-def reload_caddy_admin():
-    """Reload Caddy config using the admin API (localhost:2019)."""
-    try:
-        conn = HTTPConnection('localhost', 2019, timeout=3)
-        conn.request('POST', '/load')
-        resp = conn.getresponse()
-        if resp.status == 200:
-            echo("-----> Reloaded Caddy configuration via admin API", fg='green')
-        else:
-            body = resp.read().decode(errors='replace')
-            echo(f"Warning: Caddy admin API reload failed: {resp.status} {resp.reason}\n{body}", fg='yellow')
-        conn.close()
-    except Exception as e:
-        echo(f"Warning: Could not reload Caddy via admin API: {e}", fg='yellow')
-
+# === Application Mangement ===
 
 def found_app(kind):
     """Helper function to output app detected"""
@@ -528,6 +626,14 @@ def do_deploy(app, deltas={}, newrev=None):
         workers = parse_procfile(procfile)
         if workers and len(workers) > 0:
             settings = {}
+
+            # Check for wsgi worker and show a warning
+            if "wsgi" in workers:
+                echo("Warning: 'wsgi' worker type is deprecated. Please use 'web' instead.", fg='yellow')
+                # Convert wsgi to web worker
+                workers["web"] = workers["wsgi"]
+                workers.pop("wsgi", None)
+
             if "preflight" in workers:
                 echo("-----> Running preflight.", fg='green')
                 retval = call(workers["preflight"], cwd=app_path, env=settings, shell=True)
@@ -535,7 +641,7 @@ def do_deploy(app, deltas={}, newrev=None):
                     echo("-----> Exiting due to preflight command error value: {}".format(retval))
                     exit(retval)
                 workers.pop("preflight", None)
-                
+
             # Detect application type and deploy
             static_check_keys = set(workers.keys()) - {"preflight", "release"}
             deployed = False
@@ -566,7 +672,7 @@ def do_deploy(app, deltas={}, newrev=None):
             if not deployed:
                 echo("-----> Could not detect runtime!", fg='red')
                 echo("-----> Only Python and containerized apps are currently supported.", fg='yellow')
-            
+
             if "release" in workers:
                 echo("-----> Releasing", fg='green')
                 retval = call(workers["release"], cwd=app_path, env=settings, shell=True)
@@ -641,40 +747,40 @@ def deploy_python_with_uv(app, deltas={}):
 
 def deploy_containerized(app, deltas={}):
     """Deploy a containerized application using Podman Quadlets"""
-    
+
     app_path = join(APP_ROOT, app)
     env_file = join(APP_ROOT, app, 'ENV')
     env = {}
-    
+
     if exists(env_file):
         env.update(parse_settings(env_file, env))
-    
+
     echo("-----> Building container for '{}'".format(app), fg='green')
     call('podman build -t {app:s} .'.format(**locals()), cwd=app_path, shell=True)
-    
+
     # Ensure quadlet directory exists
     podman_dir = join(PODMAN_ROOT, app)
     if not exists(podman_dir):
         makedirs(podman_dir)
-    
+
     echo("-----> Setting up Podman Quadlet configuration for '{}'".format(app), fg='green')
-    
+
     return spawn_app(app, deltas)
 
 
 def deploy_compose(app, deltas={}):
     """Deploy an application using podman-compose"""
-    
+
     app_path = join(APP_ROOT, app)
     env_file = join(APP_ROOT, app, 'ENV')
     env = {}
-    
+
     if exists(env_file):
         env.update(parse_settings(env_file, env))
-    
+
     echo("-----> Setting up podman-compose for '{}'".format(app), fg='green')
     # Just prepare the environment, actual compose launch will be done through systemd
-    
+
     return spawn_app(app, deltas)
 
 
@@ -724,150 +830,31 @@ def spawn_app(app, deltas={}):
     if exists(settings):
         env.update(parse_settings(settings, env))
 
-    if 'web' in workers or 'wsgi' in workers or 'static' in workers:
-        echo("-----> Generating Caddy configuration", fg='green')
-        # Pick a port if none defined
+    if 'web' in workers or 'static' in workers:
+        echo("-----> Configuring web application", fg='green')
+
+        # Error if PORT is not set
         if 'PORT' not in env:
-            env['PORT'] = str(get_free_port())
-            echo("-----> picking free port {PORT}".format(**env))
+            echo("Error: PORT environment variable must be set for web applications", fg='red')
+            exit(1)
 
         # Safe defaults for addressing
         for k, v in safe_defaults.items():
             if k not in env:
                 env[k] = v
 
-        # Generate Caddy configuration
-        caddy_file = join(CADDY_ROOT, "{}.caddy".format(app))
-        caddy_domain = env.get('CADDY_DOMAIN')
-        if not caddy_domain and 'static' in workers:
-            echo(f"Warning: No CADDY_DOMAIN set for static worker in app '{app}'. Defaulting to :{env['PORT']} (public HTTP only)", fg='yellow')
-            env['CADDY_DOMAIN'] = f':{env["PORT"]}'
-            caddy_domain = f':{env["PORT"]}'
-        if caddy_domain:
-            # Ensure CADDY_DOMAIN is treated as a list
-            env['CADDY_DOMAIN'] = caddy_domain.split(',')
-            env['CADDY_DOMAIN'] = ' '.join(env['CADDY_DOMAIN'])
+        # Configure Caddy using the API if a caddy.json file exists
+        configure_caddy_for_app(app, env)
 
-            caddy_file = join(CADDY_ROOT, "{}.caddy".format(app))
-            
-            # Set up environment variables for Caddy
-            env.update({
-                'CADDY_AUTO_HTTPS': 'on',
-                'CADDY_EMAIL': env.get('CADDY_EMAIL', 'admin@example.com'),
-                'CADDY_CA_ROOT': '' if ACME_ROOT_CA == 'letsencrypt.org' else 'ca ' + ACME_ROOT_CA,
-                'SITE_NAME': env['CADDY_DOMAIN'],
-            })
+        # Set app address for environment variables
+        if 'web' in workers:
+            app_address = "{BIND_ADDRESS:s}:{PORT:s}".format(**env)
+            echo("-----> App '{}' will listen on {}".format(app, app_address))
+            env['APP_ADDRESS'] = app_address
 
-            # Set up TLS if enabled
-            tls_config = ''
-            if not get_boolean(env.get('CADDY_DISABLE_TLS', 'false')):
-                tls_config = expandvars(CADDY_TLS_TEMPLATE, env)
 
-            # Set up CloudFlare config if enabled
-            cloudflare_config = ''
-            if get_boolean(env.get('CADDY_CLOUDFLARE_ACL', 'false')):
-                try:
-                    cf = loads(urlopen('https://api.cloudflare.com/client/v4/ips').read().decode("utf-8"))
-                    if cf['success'] is True:
-                        cloudflare_ips = []
-                        for i in cf['result']['ipv4_cidrs']:
-                            cloudflare_ips.append(i)
-                        for i in cf['result']['ipv6_cidrs']:
-                            cloudflare_ips.append(i)
-                        # Add the client's IP
-                        if 'SSH_CLIENT' in environ:
-                            remote_ip = environ['SSH_CLIENT'].split()[0]
-                            echo("-----> Caddy ACL will include your IP ({})".format(remote_ip))
-                            cloudflare_ips.append(remote_ip)
-                        env['CLOUDFLARE_IPS'] = ' '.join(cloudflare_ips)
-                        cloudflare_config = expandvars(CADDY_CLOUDFLARE_CONFIG, env)
-                except Exception:
-                    echo("-----> Could not retrieve CloudFlare IP ranges: {}".format(format_exc()), fg="red")
 
-            # Set up static file mappings
-            static_mappings = ''
-            static_paths = env.get('STATIC_PATHS', '')
-            if 'static' in workers:
-                stripped = workers['static'].strip("/").rstrip("/")
-                static_paths = ("/" if stripped[0:1] == ":" else "/:") + (stripped if stripped else ".") + "/" + ("," if static_paths else "") + static_paths
-            
-            if len(static_paths):
-                try:
-                    catch_all = env.get('CATCH_ALL', '')
-                    items = static_paths.split(',')
-                    for item in items:
-                        static_url, static_path = item.split(':')
-                        if static_path[0] != '/':
-                            static_path = join(app_path, static_path).rstrip("/") + "/"
-                        echo("-----> Caddy will map {} to {}.".format(static_url, static_path))
-                        static_mappings += expandvars(CADDY_STATIC_MAPPING, locals())
-                except Exception as e:
-                    echo("Error {} in static path spec: should be /prefix1:path1[,/prefix2:path2], ignoring.".format(e))
-                    static_mappings = ''
-            
-            # Set up cache configuration if cache prefixes are defined
-            cache_config = ''
-            cache_prefixes = env.get('CACHE_PREFIXES', '')
-            if len(cache_prefixes):
-                try:
-                    try:
-                        cache_time_control = int(env.get('CACHE_CONTROL', '3600'))
-                    except Exception:
-                        echo("=====> Invalid time for cache control, defaulting to 3600s")
-                        cache_time_control = 3600
-                    
-                    prefixes = []
-                    items = cache_prefixes.split(',')
-                    for item in items:
-                        if item[0] == '/':
-                            prefixes.append(item[1:])
-                        else:
-                            prefixes.append(item)
-                    cache_prefixes = "|".join(prefixes)
-                    
-                    echo("-----> Caddy will cache /({}) paths".format(cache_prefixes))
-                    echo("-----> Caddy will send caching headers asking for {} seconds of public caching.".format(cache_time_control))
-                    
-                    cache_config = expandvars(CADDY_CACHE_TEMPLATE, locals())
-                except Exception as e:
-                    echo("Error {} in cache path spec: should be /prefix1:[,/prefix2], ignoring.".format(e))
-                    cache_config = ''
-            
-            # Set up the proxy configuration to the application
-            app_address = ''
-            if 'web' in workers or 'wsgi' in workers:
-                app_address = "{BIND_ADDRESS:s}:{PORT:s}".format(**env)
-                echo("-----> Caddy will proxy to app '{}' at {}".format(app, app_address))
-                env['APP_ADDRESS'] = app_address
-                proxy_config = expandvars(CADDY_PROXY_TEMPLATE, env)
-            else:
-                proxy_config = ''
-            
-            # Assemble the site configuration
-            site_config = expandvars(CADDY_SITE_TEMPLATE, {
-                'SITE_NAME': env['SITE_NAME'],
-                'TLS_CONFIG': tls_config,
-                'CLOUDFLARE_CONFIG': cloudflare_config,
-                'STATIC_MAPPINGS': static_mappings,
-                'PROXY_CONFIG': proxy_config,
-                'CACHE_CONFIG': cache_config
-            })
-            
-            # Create the full Caddy configuration
-            caddy_config = expandvars(CADDY_FILE_TEMPLATE, {
-                'CADDY_AUTO_HTTPS': env.get('CADDY_AUTO_HTTPS', 'on'),
-                'CADDY_EMAIL': env['CADDY_EMAIL'],
-                'CADDY_SITES': site_config
-            })
-            
-            # Write the Caddy configuration file
-            with open(caddy_file, 'w') as f:
-                f.write(caddy_config)
-            
-            echo("-----> Reloading Caddy configuration via admin API")
-            reload_caddy_admin()
-        else:
-            echo(f"Warning: No CADDY_DOMAIN set for app '{app}', and not a static worker. No Caddy config generated.", fg='yellow')
+        # We've already attempted to configure Caddy using the caddy.json approach
     # Configured worker count
     if exists(scaling):
         worker_count.update({k: int(v) for k, v in parse_procfile(scaling).items() if k in workers})
@@ -893,7 +880,7 @@ def spawn_app(app, deltas={}):
     # Create systemd directories if they don't exist
     if not exists(SYSTEMD_ROOT):
         makedirs(SYSTEMD_ROOT)
-    
+
     user_systemd_dir = join(environ['HOME'], '.config', 'systemd', 'user')
     if not exists(user_systemd_dir):
         makedirs(user_systemd_dir)
@@ -906,23 +893,23 @@ def spawn_app(app, deltas={}):
             unit_name = "{app:s}_{k:s}.{w:d}".format(**locals())
             unit_file = join(SYSTEMD_ROOT, unit_name + '.service')
             unit_link = join(user_systemd_dir, unit_name + '.service')
-            
+
             if not exists(unit_file):
                 echo("-----> Spawning '{app:s}:{k:s}.{w:d}'".format(**locals()), fg='green')
                 spawn_worker(app, k, workers[k], env, w, unit_file)
-                
+
                 # If it's a container file, we need special handling for quadlet
                 is_container = unit_file.endswith('.container')
-                
+
                 # Create quadlet directory if needed
                 quadlet_dir = join(user_systemd_dir, 'containers', 'systemd')
                 if is_container and not exists(quadlet_dir):
                     makedirs(quadlet_dir, exist_ok=True)
-                
+
                 # Use appropriate destination for symlink
                 symlink_dest = unit_file
                 symlink_target = unit_link if not is_container else join(quadlet_dir, basename(unit_file))
-                
+
                 # Create symlink to user systemd directory if it doesn't exist
                 if exists(symlink_target):
                     try:
@@ -931,13 +918,13 @@ def spawn_app(app, deltas={}):
                     except Exception as e:
                         echo(f"Warning: Could not remove existing symlink {symlink_target}: {e}", fg='yellow')
                 symlink(symlink_dest, symlink_target)
-                
+
                 # For container files, we need to run daemon-reload to generate the service
                 if is_container:
                     call('systemctl --user daemon-reload', shell=True)
                     # The actual service name is generated by podman
                     unit_name = basename(unit_file).replace('.container', '.service')
-                
+
                 # Enable and start the service
                 call('systemctl --user enable {}'.format(unit_name), shell=True)
                 call('systemctl --user start {}'.format(unit_name), shell=True)
@@ -948,21 +935,21 @@ def spawn_app(app, deltas={}):
             unit_name = "{app:s}_{k:s}.{w:d}".format(**locals())
             unit_file = join(SYSTEMD_ROOT, unit_name + '.service')
             unit_link = join(user_systemd_dir, unit_name + '.service')
-            
+
             if exists(unit_file):
                 echo("-----> Terminating '{app:s}:{k:s}.{w:d}'".format(**locals()), fg='yellow')
-                
+
                 # Stop and disable the service
                 call('systemctl --user stop {}'.format(unit_name), shell=True)
                 call('systemctl --user disable {}'.format(unit_name), shell=True)
-                
+
                 # Check if this is a container file
             is_container = unit_file.endswith('.service') and exists(unit_file.replace('.service', '.container'))
-            
+
             if is_container:
                 container_file = unit_file.replace('.service', '.container')
                 quadlet_link = join(environ['HOME'], '.config/systemd/user/containers/systemd', basename(container_file))
-                
+
                 # Remove the quadlet file and symlink
                 if exists(quadlet_link):
                     unlink(quadlet_link)
@@ -989,23 +976,14 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
     app_path = join(APP_ROOT, app)
     log_file = join(LOG_ROOT, app, "{kind}.{ordinal}.log".format(**locals()))
     data_path = join(DATA_ROOT, app)
-    
+
     # Ensure log directory exists
     log_dir = join(LOG_ROOT, app)
     if not exists(log_dir):
         makedirs(log_dir)
 
     # Set up specific worker types
-    if kind == 'wsgi':
-        # For WSGI applications, use gunicorn
-        module = command
-        # Add gunicorn to command with appropriate settings
-        command = join(env_path, 'bin', 'gunicorn')
-        command += ' --bind={BIND_ADDRESS:s}:{PORT:s}'.format(**env)
-        command += ' --workers={}'.format(env.get('GUNICORN_WORKERS', cpu_count() * 2 + 1))
-        command += ' --threads={}'.format(env.get('GUNICORN_THREADS', '4'))
-        command += ' ' + module
-    elif kind == 'web':
+    if kind == 'web':
         # Web workers run as-is
         pass
     elif kind == 'static':
@@ -1017,42 +995,42 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
         # Parse the cron pattern from the command
         cron_parts = command.split(' ', 5)
         minute, hour, day, month, weekday, cmd = cron_parts
-        
+
         # Convert cron pattern to systemd timer format
         # This is a simplified conversion and might need enhancement for complex patterns
         # Build the systemd calendar specification string using f-strings
-        weekday_str = ('Sat' if weekday == '6' else 
-                       'Sun' if weekday == '0' else 
-                       'Mon' if weekday == '1' else 
-                       'Tue' if weekday == '2' else 
-                       'Wed' if weekday == '3' else 
-                       'Thu' if weekday == '4' else 
+        weekday_str = ('Sat' if weekday == '6' else
+                       'Sun' if weekday == '0' else
+                       'Mon' if weekday == '1' else
+                       'Tue' if weekday == '2' else
+                       'Wed' if weekday == '3' else
+                       'Thu' if weekday == '4' else
                        'Fri' if weekday == '5' else '*')
-        
+
         month_str = month if month != '*' else '*'
         day_str = day if day != '*' else '*'
         hour_str = hour if hour != '*' else '*'
         minute_str = minute if minute != '*' else '*'
-        
+
         # Format the calendar specification using f-strings
         calendar_spec = f"{weekday_str} {month_str} {day_str} {hour_str} {minute_str}"
-        
+
         # Format the timer content using the template
         timer_content = SYSTEMD_TIMER_TEMPLATE.format(
             app_name=app,
             process_type=kind,
             calendar_spec=calendar_spec
         )
-        
+
         with open(timer_unit, 'w') as f:
             f.write(timer_content)
-        
+
         # Update command to be the actual command part
         command = cmd
-    
+
     # Check if this is a containerized app (Dockerfile present)
     containerized = exists(join(app_path, 'Dockerfile'))
-    
+
     # Create systemd unit file
     unit_content = ''
     if containerized:
@@ -1062,26 +1040,26 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
         host_port = env.get('PORT', '8000')
         container_port = env.get('CONTAINER_PORT', host_port)
         app_name = app
-        
+
         # Create a .container file for quadlet instead of a direct systemd unit
         quadlet_file = unit_file.replace('.service', '.container')
-        
+
         # Process additional volume mounts from environment
         extra_volumes = ""
         extra_environment = ""
         command_section = ""
-        
+
         for key, value in env.items():
             if key.startswith('VOLUME_'):
                 src, dest = value.split(':')
                 extra_volumes += f"Volume={src}:{dest}\n"
             elif not key.startswith('VOLUME_') and key != 'PORT' and key != 'CONTAINER_PORT':
                 extra_environment += f'Environment="{key}={value}"\n'
-        
+
         # Add command if specified
         if command and command.strip():
             command_section = f"Exec={command}"
-        
+
         # Format quadlet content using the template
         quadlet_content = QUADLET_CONTAINER_TEMPLATE.format(
             image=image,
@@ -1096,11 +1074,11 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
             log_path=log_file,
             app_name=app_name
         )
-        
+
         # Write the quadlet file
         with open(quadlet_file, 'w') as f:
             f.write(quadlet_content)
-        
+
         # Change the unit_file to point to the quadlet file
         # The actual .service will be generated by the podman-systemd generator
         unit_file = quadlet_file
@@ -1108,7 +1086,7 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
         # For regular applications
         # Format the environment variables for systemd
         environment_vars = '\n'.join(['Environment="{}={}"'.format(k, v) for k, v in env.items()])
-        
+
         unit_content = SYSTEMD_APP_TEMPLATE.format(
             app_name=app,
             process_type=kind,
@@ -1121,7 +1099,7 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
             command=command,
             log_path=log_file
         )
-    
+
     # Write the unit file
     with open(unit_file, 'w') as f:
         f.write(unit_content)
@@ -1132,42 +1110,42 @@ def do_stop(app):
     app = sanitize_app_name(app)
     user_systemd_dir = join(environ['HOME'], '.config', 'systemd', 'user')
     quadlet_dir = join(user_systemd_dir, 'containers', 'systemd')
-    
+
     # Find all systemd units for this app (standard units)
     units = glob(join(SYSTEMD_ROOT, '{}*.service'.format(app)))
-    
+
     # Also find all quadlet .container files
     container_files = glob(join(SYSTEMD_ROOT, '{}*.container'.format(app)))
-    
+
     if len(units) > 0 or len(container_files) > 0:
         echo("Stopping app '{}'...".format(app), fg='yellow')
-        
+
         # Handle standard service units
         for unit in units:
             unit_name = basename(unit)
             # Stop and disable the service
             call('systemctl --user stop {}'.format(unit_name), shell=True)
             call('systemctl --user disable {}'.format(unit_name), shell=True)
-            
+
             # Remove symlink from user systemd directory
             unit_link = join(user_systemd_dir, unit_name)
             if exists(unit_link):
                 unlink(unit_link)
-        
+
         # Handle quadlet container files
         for container_file in container_files:
             container_name = basename(container_file)
             service_name = container_name.replace('.container', '.service')
-            
+
             # Stop and disable the service
             call('systemctl --user stop {}'.format(service_name), shell=True)
             call('systemctl --user disable {}'.format(service_name), shell=True)
-            
+
             # Remove symlink from quadlet directory
             quadlet_link = join(quadlet_dir, container_name)
             if exists(quadlet_link):
                 unlink(quadlet_link)
-            
+
             # Run daemon-reload to update systemd
             call('systemctl --user daemon-reload', shell=True)
     else:
@@ -1178,22 +1156,22 @@ def do_restart(app):
     """Restarts a deployed app"""
     app = sanitize_app_name(app)
     user_systemd_dir = join(environ['HOME'], '.config', 'systemd', 'user')
-    
+
     # Find all systemd units for this app
     units = glob(join(SYSTEMD_ROOT, '{}*.service'.format(app)))
-    
+
     # Also find all quadlet .container files
     container_files = glob(join(SYSTEMD_ROOT, '{}*.container'.format(app)))
-    
+
     if len(units) > 0 or len(container_files) > 0:
         echo("Restarting app '{}'...".format(app), fg='yellow')
-        
+
         # Handle standard service units
         for unit in units:
             unit_name = basename(unit)
             # Restart the service
             call('systemctl --user restart {}'.format(unit_name), shell=True)
-        
+
         # Handle quadlet container files
         for container_file in container_files:
             service_name = basename(container_file).replace('.container', '.service')
@@ -1254,7 +1232,6 @@ def multi_tail(app, filenames, catch_up=20):
                         inodes[f] = stat(f).st_ino
                 else:
                     filenames.remove(f)
-
 
 # === CLI commands ===
 
@@ -1381,17 +1358,14 @@ def cmd_destroy(app):
     # Stop services first
     do_stop(app)
 
+    # Remove Caddy configuration via API
+    remove_caddy_config_for_app(app)
+
     # Remove app directories
     for p in [join(x, app) for x in [APP_ROOT, GIT_ROOT, ENV_ROOT, LOG_ROOT, SYSTEMD_ROOT]]:
         if exists(p):
             echo("--> Removing folder '{}'".format(p), fg='yellow')
             rmtree(p)
-
-    # Remove Caddy config
-    caddy_file = join(CADDY_ROOT, "{}.caddy".format(app))
-    if exists(caddy_file):
-        echo("--> Removing file '{}'".format(caddy_file), fg='yellow')
-        remove(caddy_file)
 
     # leave DATA_ROOT, since apps may create hard to reproduce data
     # leave CACHE_ROOT, since apps might use it for important stuff
@@ -1403,7 +1377,6 @@ def cmd_destroy(app):
     if exists('/etc/systemd/system/caddy.service'):
         echo("-----> Reloading Caddy configuration")
         call('systemctl reload caddy', shell=True)
-
 
 @command("logs")
 @argument('app')
@@ -1515,7 +1488,7 @@ def cmd_setup():
     if not exists(user_systemd_dir):
         echo("Creating '{}'.".format(user_systemd_dir), fg='green')
         makedirs(user_systemd_dir)
-    
+
     # Create systemd user quadlet directory
     quadlet_dir = join(user_systemd_dir, 'containers', 'systemd')
     if not exists(quadlet_dir):
@@ -1528,19 +1501,19 @@ def cmd_setup():
     for req in requirements:
         if not which(req):
             missing.append(req)
-    
+
     if missing:
         echo("Warning: Missing required binaries: {}".format(', '.join(missing)), fg='yellow')
         echo("You'll need to install these packages before using Kata", fg='yellow')
-        
+
     # Verify podman-system-generator is available for quadlet integration
     podman_generator = False
-    for path in ['/usr/lib/systemd/system-generators/podman-system-generator', 
+    for path in ['/usr/lib/systemd/system-generators/podman-system-generator',
                  '/usr/local/lib/systemd/system-generators/podman-system-generator']:
         if exists(path):
             podman_generator = True
             break
-    
+
     if not podman_generator:
         echo("Warning: podman-system-generator not found.", fg='yellow')
         echo("Container quadlet functionality may not work correctly.", fg='yellow')
@@ -1580,30 +1553,27 @@ def cmd_setup_ssh(public_key_file):
 
 @command("setup:caddy")
 def cmd_setup_caddy():
-    """Set up the main Caddyfile to import all per-app .caddy files."""
+    """Setup caddy.json template file for apps"""
+    # Display a sample caddy.json file with environment variable support
+    sample = {
+        "listen": [":$PORT"],
+        "routes": [{
+            "match": [{
+                "host": ["$DOMAIN_NAME"]
+            }],
+            "handle": [{
+                "handler": "reverse_proxy",
+                "upstreams": [{
+                    "dial": "$BIND_ADDRESS:$PORT"
+                }]
+            }]
+        }]
+    }
+    echo("\nSample caddy.json file (place this in your app directory):", fg="green")
+    echo(dumps(sample, indent=2), fg="white")
+    echo("\nEnvironment variables like $PORT, $DOMAIN_NAME, etc. will be replaced with actual values.", fg="yellow")
+    echo("Make sure to set PORT in your ENV file.\n", fg="yellow")
 
-    caddy_import_path = join(environ['HOME'], ".kata", "caddy", "*.caddy")
-    main_caddyfile = CADDY_MAINFILE_TEMPLATE.format(import_path=caddy_import_path)
-
-    # Write reference copy to ~/.kata/Caddyfile
-    kata_caddyfile_path = join(environ["HOME"], ".kata", "Caddyfile")
-    makedirs(dirname(kata_caddyfile_path), exist_ok=True)
-    with open(kata_caddyfile_path, "w") as f:
-        f.write(main_caddyfile)
-
-    # Write to /etc/caddy/Caddyfile using sudo
-    try:
-        call(f"cp /etc/caddy/Caddyfile {KATA_ROOT}", shell=True)
-        with NamedTemporaryFile(mode="w") as f:
-            tempfile = f.name
-            with open(tempfile, "w") as f:
-                f.write(main_caddyfile)
-            call(f"sudo cp {tempfile} /etc/caddy/Caddyfile",  cwd=KATA_ROOT, shell=True)
-        echo(f"Main Caddyfile installed to /etc/caddy/Caddyfile. Original file in {KATA_ROOT}.", fg='green')
-        echo("Please reload Caddy: sudo systemctl reload caddy")
-    except Exception as e:
-        echo(f"Error installing Caddyfile: {e}", fg='red')
-        
 
 @command("update")
 def cmd_update():
@@ -1628,7 +1598,7 @@ def cmd_update():
 @command("git-hook")
 @argument('app')
 def cmd_git_hook(app):
-    """INTERNAL: Post-receive git hook"""
+    # INTERNAL: Post-receive git hook
 
     app = sanitize_app_name(app)
     repo_path = join(GIT_ROOT, app)
@@ -1652,7 +1622,7 @@ def cmd_git_hook(app):
 @command("git-receive-pack")
 @argument('app')
 def cmd_git_receive_pack(app):
-    """INTERNAL: Handle git pushes for an app"""
+    # INTERNAL: Handle git pushes for an app
 
     app = sanitize_app_name(app)
     hook_path = join(GIT_ROOT, app, 'hooks', 'post-receive')
@@ -1676,7 +1646,7 @@ cat | KATA_ROOT="{KATA_ROOT:s}" {KATA_SCRIPT:s} git-hook {app:s}""".format(**env
 @command("git-upload-pack")
 @argument('app')
 def cmd_git_upload_pack(app):
-    """INTERNAL: Handle git upload pack for an app"""
+    # INTERNAL: Handle git upload pack for an app
     app = sanitize_app_name(app)
     env = globals()
     env.update(locals())
