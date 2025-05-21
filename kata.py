@@ -244,12 +244,11 @@ _arguments = {}
 def command(name):
     """Register a function as a CLI command"""
     def decorator(f):
-        if f.__doc__:
-            _commands[name] = {
-                "name": name,
-                "func": f,
-                "doc": f.__doc__
-            }
+        _commands[name] = {
+            "name": name,
+            "func": f,
+            "doc": f.__doc__
+        }
         return f
     return decorator
 
@@ -296,18 +295,19 @@ class Context(dict):
 
     def get_help(self):
         """Get help information"""
-        return "The smallest PaaS you've ever seen"
+        return "The other smallest PaaS you've ever seen"
 
 def show_help():
     """Show help for all commands"""
     # Get program description
-    echo("Kata: The smallest PaaS you've ever seen", fg="green")
+    echo("Kata: The other smallest PaaS you've ever seen", fg="green")
 
     echo("\nCommands:", fg="green")
     for cmd_name in sorted(_commands.keys()):
         cmd_info = _commands[cmd_name]
         cmd_help = (cmd_info["doc"] or "").split("\n")[0]
-        echo(f"  {cmd_name:<15} {cmd_help}", fg="white")
+        if cmd_help:
+            echo(f"  {cmd_name:<15} {cmd_help}", fg="white")
     echo("")
 
 def run_cli():
@@ -389,9 +389,11 @@ def load_caddy_json(app_path):
     if exists(caddy_json_path):
         try:
             with open(caddy_json_path, 'r') as f:
+                echo(f"-----> Found caddy.json configuration", fg='green')
                 return loads(f.read())
         except Exception as e:
             echo(f"Error loading caddy.json for app: {e}", fg='red')
+            echo(f"Make sure your caddy.json contains valid JSON", fg='yellow')
     return None
 
 def expand_env_in_json(json_obj, env):
@@ -405,6 +407,29 @@ def expand_env_in_json(json_obj, env):
     else:
         return json_obj
 
+def get_worker_types(app):
+    """Return list of worker types for an app"""
+    app = sanitize_app_name(app)
+    app_path = join(APP_ROOT, app)
+    procfile = join(app_path, 'Procfile')
+    
+    # First check if we parsed workers from procfile
+    if exists(procfile):
+        workers = parse_procfile(procfile)
+        if workers:
+            return list(workers.keys())
+    
+    # Check for special case workers from container/compose deployments 
+    workers = []
+    if exists(join(app_path, 'Dockerfile')):
+        workers.append('container')
+    if exists(join(app_path, 'docker-compose.yaml')):
+        workers.append('compose')
+    if exists(join(app_path, 'caddy.json')) and not workers:
+        workers.append('static')
+    
+    return workers
+
 def configure_caddy_for_app(app, env):
     """Configure Caddy for an app using the admin API"""
     app = sanitize_app_name(app)
@@ -416,6 +441,12 @@ def configure_caddy_for_app(app, env):
     # If no caddy.json found, return early
     if not config_json:
         echo(f"No caddy.json found for app '{app}', skipping Caddy configuration", fg='yellow')
+        echo(f"Add a caddy.json file to configure web routing for this app", fg='yellow')
+        return False
+        
+    # Ensure PORT is set for Caddy configuration
+    if 'PORT' not in env and not any(worker in ['container', 'compose'] for worker in get_worker_types(app)):
+        echo(f"Error: PORT environment variable must be set for Caddy configuration", fg='red')
         return False
 
     try:
@@ -430,6 +461,8 @@ def configure_caddy_for_app(app, env):
         body = resp.read().decode('utf-8', errors='replace')
         if resp.status in (200, 201, 204):
             echo(f"-----> Successfully configured Caddy for app '{app}'", fg='green')
+            echo(f"-----> Use 'kata config:caddy:app {app}' to view the configuration", fg='green')
+            echo(f"-----> Use 'kata config:caddy' to view the complete Caddy configuration", fg='green')
             return True
         else:
             echo(f"Warning: Caddy API configuration failed: {resp.status} {resp.reason}\n{body}", fg='yellow')
@@ -439,10 +472,50 @@ def configure_caddy_for_app(app, env):
         echo(f"Error configuring Caddy for app '{app}': {e}", fg='red')
         return False
 
+def get_caddy_config(app=None):
+    """Get Caddy configuration using the admin API
+    
+    If app is provided, returns configuration for just that app.
+    If app is None, returns the entire Caddy configuration.
+    Returns None if the configuration is not found or Caddy API is not available.
+    """
+    try:
+        conn = http.client.HTTPConnection('localhost', 2019, timeout=5)
+
+        # For app-specific configuration, we still need to fetch the entire config
+        # because the direct app endpoint returns the full structure
+        api_path = "/config/"
+
+        # Send GET request to Caddy API
+        conn.request('GET', api_path)
+
+        resp = conn.getresponse()
+        body = resp.read().decode('utf-8', errors='replace')
+        
+        if resp.status == 200:
+            config = loads(body)
+            if app:
+                # If app is specified, extract just the server config for that app
+                app = sanitize_app_name(app)
+                if 'apps' in config and 'http' in config['apps']:
+                    if 'servers' in config['apps']['http'] and app in config['apps']['http']['servers']:
+                        return config['apps']['http']['servers'][app]
+                    else:
+                        return None  # App-specific config not found
+                else:
+                    return None  # Invalid config structure
+            else:
+                return config  # Return full config
+        else:
+            return None
+    except Exception as e:
+        echo(f"Error getting Caddy configuration: {e}", fg='red')
+        return None
+
 def remove_caddy_config_for_app(app):
     """Remove Caddy configuration for an app using the admin API"""
     app = sanitize_app_name(app)
-
+    
     try:
         echo(f"-----> Removing Caddy configuration for app '{app}'", fg='yellow')
         conn = http.client.HTTPConnection('localhost', 2019, timeout=5)
@@ -455,16 +528,15 @@ def remove_caddy_config_for_app(app):
 
         resp = conn.getresponse()
         resp.read()  # Consume the response body
-
+        
         if resp.status in (200, 204):
             echo(f"-----> Successfully removed Caddy configuration for app '{app}'", fg='green')
             return True
         else:
-            echo(f"Warning: Failed to remove Caddy config: {resp.status} {resp.reason}", fg='yellow')
+            echo(f"Warning: Failed to remove Caddy configuration for app '{app}': {resp.status} {resp.reason}", fg='yellow')
             return False
-
     except Exception as e:
-        echo(f"Error removing Caddy configuration for app '{app}': {e}", fg='red')
+        echo(f"Error removing Caddy configuration: {e}", fg='red')
         return False
 
 
@@ -522,7 +594,7 @@ def parse_procfile(filename):
     """Parses a Procfile and returns the worker types. Only one worker of each type is allowed."""
     workers = {}
     if not exists(filename):
-        return None
+        return {}
 
     with open(filename, 'r') as procfile:
         for line_number, line in enumerate(procfile):
@@ -611,6 +683,9 @@ def do_deploy(app, deltas={}, newrev=None):
 
     app_path = join(APP_ROOT, app)
     procfile = join(app_path, 'Procfile')
+    caddy_json_path = join(app_path, 'caddy.json')
+    dockerfile_path = join(app_path, 'Dockerfile')
+    compose_path = join(app_path, 'docker-compose.yaml')
     log_path = join(LOG_ROOT, app)
 
     env = {'GIT_WORK_DIR': app_path}
@@ -624,6 +699,12 @@ def do_deploy(app, deltas={}, newrev=None):
         if not exists(log_path):
             makedirs(log_path)
         workers = parse_procfile(procfile)
+        caddy_json_path = join(app_path, 'caddy.json')
+        
+        # Add a virtual 'static' worker if we have caddy.json but no workers from Procfile
+        if (not workers or len(workers) == 0) and exists(caddy_json_path):
+            workers = {"static": "echo 'Static site via Caddy'"}
+            
         if workers and len(workers) > 0:
             settings = {}
 
@@ -651,10 +732,10 @@ def do_deploy(app, deltas={}, newrev=None):
             elif exists(join(app_path, 'pyproject.toml')) and (exists(join(app_path, 'uv.lock')) or exists(join(app_path, '.uv'))) and which('uv') and found_app("Python (uv)"):
                 settings.update(deploy_python_with_uv(app, deltas))
                 deployed = True
-            elif exists(join(app_path, 'Dockerfile')) and found_app("Containerized") and check_requirements(['podman']):
+            elif exists(dockerfile_path) and found_app("Containerized") and check_requirements(['podman']):
                 settings.update(deploy_containerized(app, deltas))
                 deployed = True
-            elif exists(join(app_path, 'docker-compose.yaml')) and found_app("Docker Compose") and check_requirements(['podman-compose']):
+            elif exists(compose_path) and found_app("Docker Compose") and check_requirements(['podman-compose']):
                 settings.update(deploy_compose(app, deltas))
                 deployed = True
             elif (
@@ -670,8 +751,29 @@ def do_deploy(app, deltas={}, newrev=None):
                 settings.update(spawn_app(app, deltas))
                 deployed = True
             if not deployed:
-                echo("-----> Could not detect runtime!", fg='red')
-                echo("-----> Only Python and containerized apps are currently supported.", fg='yellow')
+                # One final check for static site with just caddy.json
+                if exists(caddy_json_path):
+                    echo("-----> Detected static site with caddy.json", fg='green')
+                    settings.update(spawn_app(app, deltas))
+                    deployed = True
+                # Check for containerized apps
+                elif exists(dockerfile_path) and found_app("Containerized") and check_requirements(['podman']):
+                    if exists(caddy_json_path):
+                        echo("-----> Deploying containerized app with web interface via caddy.json", fg='green')
+                    else:
+                        echo("-----> Deploying containerized app without web interface", fg='green')
+                    settings.update(deploy_containerized(app, deltas))
+                    deployed = True
+                elif exists(compose_path) and found_app("Docker Compose") and check_requirements(['podman-compose']):
+                    if exists(caddy_json_path):
+                        echo("-----> Deploying compose app with web interface via caddy.json", fg='green')
+                    else:
+                        echo("-----> Deploying compose app without web interface", fg='green')
+                    settings.update(deploy_compose(app, deltas))
+                    deployed = True
+                else:
+                    echo("-----> Could not detect runtime!", fg='red')
+                    echo("-----> Only Python, containerized apps, and static sites with caddy.json are currently supported.", fg='yellow')
 
             if "release" in workers:
                 echo("-----> Releasing", fg='green')
@@ -681,7 +783,29 @@ def do_deploy(app, deltas={}, newrev=None):
                     exit(retval)
                 workers.pop("release", None)
         else:
-            echo("Error: Invalid Procfile for app '{}'.".format(app), fg='red')
+            # Check for container files or caddy.json even without a valid Procfile
+            if exists(dockerfile_path) and found_app("Containerized") and check_requirements(['podman']):
+                echo("-----> No Procfile found, but Dockerfile exists. Deploying containerized app.", fg='yellow')
+                # Create a non-web worker for the container
+                workers = {"container": "podman"}
+                settings = deploy_containerized(app, deltas)
+                # If we also have caddy.json, mention it will be used for web routing
+                if exists(caddy_json_path):
+                    echo("-----> Found caddy.json, will configure web routing for containerized app", fg='green')
+            elif exists(compose_path) and found_app("Docker Compose") and check_requirements(['podman-compose']):
+                echo("-----> No Procfile found, but docker-compose.yaml exists. Deploying with podman-compose.", fg='yellow')
+                # Create a non-web worker for the compose setup
+                workers = {"compose": "podman-compose"}
+                settings = deploy_compose(app, deltas)
+                # If we also have caddy.json, mention it will be used for web routing
+                if exists(caddy_json_path):
+                    echo("-----> Found caddy.json, will configure web routing for compose app", fg='green')
+            # Check if there's a caddy.json file even though Procfile is invalid/empty
+            elif exists(caddy_json_path):
+                echo("-----> No valid Procfile found, but caddy.json exists. Deploying as static site.", fg='yellow')
+                settings = spawn_app(app, deltas)
+            else:
+                echo("Error: No valid Procfile, Dockerfile, docker-compose.yaml or caddy.json found for app '{}'.".format(app), fg='red')
     else:
         echo("Error: app '{}' not found.".format(app), fg='red')
 
@@ -789,11 +913,40 @@ def spawn_app(app, deltas={}):
 
     app_path = join(APP_ROOT, app)
     procfile = join(app_path, 'Procfile')
+    caddy_json_path = join(app_path, 'caddy.json')
+    dockerfile_path = join(app_path, 'Dockerfile')
+    compose_path = join(app_path, 'docker-compose.yaml')
+    
     workers = parse_procfile(procfile)
     workers.pop("preflight", None)
     workers.pop("release", None)
     ordinals = defaultdict(lambda: 1)
     worker_count = {k: 1 for k in workers.keys()}
+
+    # Handle special cases where we don't have a Procfile or it's empty
+    if len(workers) == 0:
+        if exists(dockerfile_path):
+            echo("-----> No Procfile found, but Dockerfile exists. Using containerized deployment.", fg='yellow')
+            workers["container"] = "podman"  # Use a non-web worker type
+            worker_count["container"] = 1
+            # If we also have caddy.json, mention it will be used for web routing
+            if exists(caddy_json_path):
+                echo("-----> Found caddy.json, will configure web routing for containerized app", fg='green')
+                # Default port will be set in spawn_app
+        # For compose apps without Procfile, add a system worker (not web)
+        elif exists(compose_path):
+            echo("-----> No Procfile found, but docker-compose.yaml exists. Using compose deployment.", fg='yellow')
+            workers["compose"] = "podman-compose"  # Use a non-web worker type
+            worker_count["compose"] = 1
+            # If we also have caddy.json, mention it will be used for web routing
+            if exists(caddy_json_path):
+                echo("-----> Found caddy.json, will configure web routing for compose app", fg='green')
+                # Default port will be set in spawn_app
+        # Add a virtual 'static' worker if we have only caddy.json but no container/compose files
+        elif exists(caddy_json_path):
+            echo("-----> No Procfile found, but caddy.json exists. Treating as static site.", fg='yellow')
+            workers["static"] = "echo 'Static site via Caddy'"
+            worker_count["static"] = 1
 
     # the Python virtualenv
     virtualenv_path = join(ENV_ROOT, app)
@@ -809,8 +962,10 @@ def spawn_app(app, deltas={}):
     # Bootstrap environment
     env = {
         'APP': app,
-        'LOG_ROOT': LOG_ROOT,
+        'APP_ROOT': join(APP_ROOT, app),
+        'LOG_ROOT': join(LOG_ROOT, app),
         'DATA_ROOT': join(DATA_ROOT, app),
+        'CACHE_ROOT': join(CACHE_ROOT, app),
         'HOME': environ['HOME'],
         'USER': environ['USER'],
         'PATH': ':'.join([join(virtualenv_path, 'bin'), environ['PATH']]),
@@ -830,11 +985,19 @@ def spawn_app(app, deltas={}):
     if exists(settings):
         env.update(parse_settings(settings, env))
 
-    if 'web' in workers or 'static' in workers:
+    # For containerized apps with caddy.json, set a default port if none exists
+    if ('container' in workers.keys() or 'compose' in workers.keys()) and exists(caddy_json_path) and 'PORT' not in env:
+        echo("-----> No PORT specified in ENV, using default port 8080 for Caddy configuration", fg='yellow')
+        env['PORT'] = '8080'
+
+    # Check whether we need to configure Caddy
+    needs_caddy = 'web' in workers or 'static' in workers or exists(caddy_json_path)
+    
+    if needs_caddy:
         echo("-----> Configuring web application", fg='green')
 
-        # Error if PORT is not set
-        if 'PORT' not in env:
+        # Error if PORT is not set for web applications (only needed for non-containerized apps)
+        if 'PORT' not in env and not any(worker_type in ['container', 'compose'] for worker_type in workers.keys()):
             echo("Error: PORT environment variable must be set for web applications", fg='red')
             exit(1)
 
@@ -846,7 +1009,7 @@ def spawn_app(app, deltas={}):
         # Configure Caddy using the API if a caddy.json file exists
         configure_caddy_for_app(app, env)
 
-        # Set app address for environment variables
+        # Set app address for environment variables - only for web workers
         if 'web' in workers:
             app_address = "{BIND_ADDRESS:s}:{PORT:s}".format(**env)
             echo("-----> App '{}' will listen on {}".format(app, app_address))
@@ -1339,6 +1502,42 @@ def cmd_config_live(app):
         echo("Warning: app '{}' not deployed, no config found.".format(app), fg='yellow')
 
 
+@command("config:caddy")
+def cmd_config_caddy():
+    """Display complete Caddy configuration, e.g.: kata config:caddy"""
+    
+    # Get the current Caddy configuration
+    config = get_caddy_config()
+    
+    if config:
+        # Pretty print the JSON configuration
+        echo("==== COMPLETE CADDY CONFIGURATION ====", fg='green')
+        echo(dumps(config, indent=2), fg='white')
+    else:
+        echo("No Caddy configuration found. Make sure Caddy is running with the admin API enabled.", fg='yellow')
+        echo("The admin API should be available at localhost:2019.", fg='yellow')
+
+
+@command("config:caddy:app")
+@argument('app')
+def cmd_config_caddy_app(app):
+    """Display Caddy configuration for an app, e.g.: kata config:caddy:app <app>"""
+    
+    app = exit_if_invalid(app)
+
+    # Get the current Caddy configuration for the app
+    config = get_caddy_config(app)
+    
+    if config:
+        # Pretty print the JSON configuration, showing only relevant app section
+        echo("==== CADDY CONFIGURATION FOR '{}' ====".format(app), fg='green')
+        echo(dumps(config, indent=2), fg='white')
+    else:
+        echo("No Caddy configuration found for app '{}'.".format(app), fg='yellow')
+        echo("Deploy the app with a caddy.json file to configure Caddy.", fg='yellow')
+        echo("Or ensure the app has been deployed successfully.", fg='yellow')
+
+
 @command("deploy")
 @argument('app')
 def cmd_deploy(app):
@@ -1577,7 +1776,7 @@ def cmd_setup_caddy():
 
 @command("update")
 def cmd_update():
-    """Update the kata cli"""
+    """Update the kata server script"""
     echo("Updating kata...")
 
     with NamedTemporaryFile(mode="w") as f:
