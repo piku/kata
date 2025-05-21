@@ -11,6 +11,7 @@ The refactor also aims to simplify the codebase by removing unnecessary dependen
 ## Goals
 
 * Switch from `nginx` to `caddy`
+  * require explicit `caddy.json` configuration for apps that require web server features
 * Switch from `uwsgi` to `systemd` and `podman` to run apps
 * Support only a subset of the runtimes (Python, others via `podman` in a first step)
   * use `systemd --user` and `podman` quadlets to support other runtimes using pre-defined base images
@@ -29,7 +30,11 @@ The refactor also aims to simplify the codebase by removing unnecessary dependen
 
 ### Core Technology Switches
 
-* [x] Switch from `nginx` to `caddy`
+* [ ] Switch from `nginx` to `caddy`
+  * [ ] Support `caddy.json` configuration for apps that require web server features
+  * [ ] Support `caddy` for static file serving
+  * [ ] Support automatic HTTPS setup via `caddy`
+  * [ ] Support Cloudflare-only inbound IP filtering via `caddy`
 * [x] Switch from `uWSGI` to `systemd` to run apps
 * [x] Switch from `uWSGI` to `podman` to run containerized apps
 
