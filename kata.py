@@ -430,8 +430,8 @@ def configure_caddy_for_app(app, env):
 
         if resp.status in (200, 201, 204):
             echo(f"-----> Successfully configured Caddy for app '{app}'", fg='green')
-            echo(f"-----> Use 'kata config:app {app}' to view the configuration", fg='green')
-            echo(f"-----> Use 'kata config:caddy' to view the complete Caddy configuration", fg='green')
+            echo(f"-----> Use 'kata caddy:app {app}' to view the configuration", fg='green')
+            echo(f"-----> Use 'kata caddy' to view the complete Caddy configuration", fg='green')
             return True
         else:
             echo(f"Warning: Caddy API configuration failed: {resp.status} {resp.reason}\n{body}", fg='yellow')
@@ -1438,9 +1438,9 @@ def cmd_config_live(app):
         echo("Warning: app '{}' not deployed, no config found.".format(app), fg='yellow')
 
 
-@command("config:caddy")
-def cmd_config_caddy():
-    """Display complete Caddy configuration, e.g.: kata config:caddy"""
+@command("caddy")
+def cmd_caddy():
+    """Display complete Caddy configuration, e.g.: kata caddy"""
 
     # Get the current Caddy configuration
     config = get_caddy_config()
@@ -1454,10 +1454,10 @@ def cmd_config_caddy():
         echo("The admin API should be available at localhost:2019.", fg='yellow')
 
 
-@command("config:app")
+@command("caddy:app")
 @argument("app")
-def cmd_config_caddy_app(app):
-    """Display Caddy configuration for an app, e.g.: kata config:app <app>"""
+def cmd_caddy_app(app):
+    """Display Caddy configuration for an app, e.g.: kata caddy:app <app>"""
 
     app = exit_if_invalid(app)
 
