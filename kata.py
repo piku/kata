@@ -1457,7 +1457,7 @@ def cmd_config_caddy():
 @command("config:app")
 @argument("app")
 def cmd_config_caddy_app(app):
-    """Display Caddy configuration for an app, e.g.: kata config:caddy:app <app>"""
+    """Display Caddy configuration for an app, e.g.: kata config:app <app>"""
 
     app = exit_if_invalid(app)
 
