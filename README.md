@@ -1,5 +1,7 @@
 # kata
 
+Kata is a tool for deploying and managing applications using systemd, Podman, and Caddy. It simplifies the process of creating, updating, and destroying application instances while providing a consistent environment for development and production, and is a direct descendant of `piku`.
+
 > Kata (型), meaning "form," "model," or "pattern." This aligns with the structured approach of systemd unit files, Dockerfiles/Quadlets for Podman, and Caddyfiles, representing the defined "forms" for deploying and managing applications
 
 # Requirements
@@ -11,7 +13,7 @@
 - `caddy`: 2.4 or later
 - `podman-compose`: 1.0 or later
 
-This means that Debian 13 (Trixie) or later is a requirement.
+This means that Debian 13 (Trixie) or later is a requirement. Additionally, in `trixie` you should `systemctl enable caddy-api` to make sure Caddy is started with API config persistence.
 
 ## Caddy Configuration
 
@@ -52,7 +54,10 @@ Serve static files from a directory:
     }
   ]
 }
+
 ```
+
+This replaces the `static` worker in a `piku` Procfile.
 
 > **Note:** Use `$APP_ROOT` when your static files are part of your git repository. Use `$DATA_ROOT` when files are generated or uploaded separately from deployments.
 
@@ -195,6 +200,8 @@ Make sure to set these key environment variables in your application's ENV file:
 - `BIND_ADDRESS`: The address to bind to (defaults to 127.0.0.1).
 - `DOMAIN_NAME`: For HTTPS configurations, set this to your domain name.
 
+
+
 You can also use these kata-specific variables in your caddy.json:
 
 - `$APP_ROOT`: App directory path (typically ~/.kata/apps/your-app) - use for files in your git repository
@@ -209,8 +216,10 @@ For more detailed Caddy configurations, refer to the [Caddy JSON documentation](
 Kata interacts with Caddy through its admin API, which by default runs on `localhost:2019`. When you deploy an app, if a `caddy.json` file is present:
 
 1. The file is loaded and environment variables are expanded
-2. The configuration is sent to Caddy's API endpoint at `/config/apps/http/servers/your-app`
-3. When an app is destroyed, its configuration is removed via the API
+2. The current complete Caddy configuration is retrieved from the API
+3. Your app's configuration is updated within the complete configuration structure, preserving all other settings
+4. The entire updated configuration is sent to Caddy's `/load` endpoint
+5. When an app is destroyed, its configuration is similarly removed from the complete configuration while preserving all other settings
 
 Make sure Caddy is running with its admin API enabled. The default configuration in kata assumes Caddy is started with:
 
@@ -220,4 +229,3 @@ Make sure Caddy is running with its admin API enabled. The default configuration
   admin localhost:2019
 }
 ```
-
