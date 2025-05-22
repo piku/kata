@@ -390,10 +390,22 @@ def load_caddy_json(app_path):
         try:
             with open(caddy_json_path, 'r') as f:
                 echo(f"-----> Found caddy.json configuration", fg='green')
-                return loads(f.read())
+                json_content = f.read()
+                try:
+                    return loads(json_content)
+                except Exception as json_error:
+                    echo(f"Error parsing caddy.json: {json_error}", fg='red')
+                    # Try to identify the location of the error
+                    import json
+                    try:
+                        json.loads(json_content)
+                    except json.JSONDecodeError as detailed_error:
+                        echo(f"JSON syntax error at line {detailed_error.lineno}, column {detailed_error.colno}: {detailed_error.msg}", fg='yellow')
+                    echo(f"Make sure your caddy.json contains valid JSON", fg='yellow')
+                    return None
         except Exception as e:
             echo(f"Error loading caddy.json for app: {e}", fg='red')
-            echo(f"Make sure your caddy.json contains valid JSON", fg='yellow')
+            echo(f"Make sure your caddy.json file exists and is readable", fg='yellow')
     return None
 
 def expand_env_in_json(json_obj, env):
@@ -412,14 +424,14 @@ def get_worker_types(app):
     app = sanitize_app_name(app)
     app_path = join(APP_ROOT, app)
     procfile = join(app_path, 'Procfile')
-    
+
     # First check if we parsed workers from procfile
     if exists(procfile):
         workers = parse_procfile(procfile)
         if workers:
             return list(workers.keys())
-    
-    # Check for special case workers from container/compose deployments 
+
+    # Check for special case workers from container/compose deployments
     workers = []
     if exists(join(app_path, 'Dockerfile')):
         workers.append('container')
@@ -427,38 +439,94 @@ def get_worker_types(app):
         workers.append('compose')
     if exists(join(app_path, 'caddy.json')) and not workers:
         workers.append('static')
-    
+
     return workers
+
+def validate_caddy_json(config):
+    if not isinstance(config, dict):
+        return False, "Configuration must be a JSON object"
+    if 'listen' in config and not isinstance(config['listen'], list):
+        return False, "'listen' must be an array of strings"
+
+    if 'routes' in config and not isinstance(config['routes'], list):
+        return False, "'routes' must be an array of route objects"
+
+    # Check for common missing fields
+    if 'routes' not in config and 'handle' not in config:
+        return False, "Missing required 'routes' or 'handle' field"
+
+    # Check for common handler errors
+    if 'handle' in config and isinstance(config['handle'], list):
+        for handler in config['handle']:
+            if not isinstance(handler, dict):
+                return False, "Each handler must be an object"
+            if 'handler' not in handler:
+                return False, "Each handler must have a 'handler' field"
+
+    return True, None
 
 def configure_caddy_for_app(app, env):
     """Configure Caddy for an app using the admin API"""
     app = sanitize_app_name(app)
     app_path = join(APP_ROOT, app)
 
-    # Load caddy.json from app directory
     config_json = load_caddy_json(app_path)
 
-    # If no caddy.json found, return early
     if not config_json:
         echo(f"No caddy.json found for app '{app}', skipping Caddy configuration", fg='yellow')
         echo(f"Add a caddy.json file to configure web routing for this app", fg='yellow')
         return False
-        
-    # Ensure PORT is set for Caddy configuration
+
+    is_valid, error_message = validate_caddy_json(config_json)
+    if not is_valid:
+        echo(f"Error in caddy.json: {error_message}", fg='red')
+        echo(f"Please check your caddy.json file for errors", fg='yellow')
+        return False
+
     if 'PORT' not in env and not any(worker in ['container', 'compose'] for worker in get_worker_types(app)):
         echo(f"Error: PORT environment variable must be set for Caddy configuration", fg='red')
         return False
-
     try:
         config_json = expand_env_in_json(config_json, env)
         config_data = dumps(config_json).encode('utf-8')
         echo(f"-----> Configuring Caddy for app '{app}'", fg='green')
+        try:
+            del_conn = http.client.HTTPConnection('localhost', 2019, timeout=5)
+            del_conn.request('DELETE', f"/config/apps/http/servers/{app}")
+            del_resp = del_conn.getresponse()
+            del_resp.read()  # Consume response
+            del_conn.close()
+            sleep(0.5)
+        except Exception:
+            pass
+
         conn = http.client.HTTPConnection('localhost', 2019, timeout=5)
         api_path = f"/config/apps/http/servers/{app}"
-        conn.request('PUT', api_path, body=config_data,
-                    headers={'Content-Type': 'application/json'})
+        conn.request('POST', api_path, body=config_data,
+                     headers={'Content-Type': 'application/json'})
         resp = conn.getresponse()
         body = resp.read().decode('utf-8', errors='replace')
+        if resp.status not in (200, 201, 204):
+            try:
+                patch_conn = http.client.HTTPConnection('localhost', 2019, timeout=5)
+                patch_conn.request('PATCH', api_path, body=config_data,
+                         headers={'Content-Type': 'application/json'})
+                patch_resp = patch_conn.getresponse()
+                patch_body = patch_resp.read().decode('utf-8', errors='replace')
+                patch_conn.close()
+
+                if patch_resp.status in (200, 201, 204):
+                    echo(f"-----> Successfully configured Caddy for app '{app}' using PATCH", fg='green')
+                    echo(f"-----> Use 'kata config:caddy:app {app}' to view the configuration", fg='green')
+                    echo(f"-----> Use 'kata config:caddy' to view the complete Caddy configuration", fg='green')
+                    return True
+                else:
+                    echo(f"Warning: Caddy API PATCH failed: {patch_resp.status} {patch_resp.reason}\n{patch_body}", fg='yellow')
+                    return False
+            except Exception as e:
+                echo(f"Error during PATCH: {e}", fg='red')
+                return False
+
         if resp.status in (200, 201, 204):
             echo(f"-----> Successfully configured Caddy for app '{app}'", fg='green')
             echo(f"-----> Use 'kata config:caddy:app {app}' to view the configuration", fg='green')
@@ -471,31 +539,20 @@ def configure_caddy_for_app(app, env):
     except Exception as e:
         echo(f"Error configuring Caddy for app '{app}': {e}", fg='red')
         return False
+    finally:
+        pass
 
 def get_caddy_config(app=None):
-    """Get Caddy configuration using the admin API
-    
-    If app is provided, returns configuration for just that app.
-    If app is None, returns the entire Caddy configuration.
-    Returns None if the configuration is not found or Caddy API is not available.
-    """
+    """Get Caddy configuration using the admin API"""
     try:
         conn = http.client.HTTPConnection('localhost', 2019, timeout=5)
-
-        # For app-specific configuration, we still need to fetch the entire config
-        # because the direct app endpoint returns the full structure
         api_path = "/config/"
-
-        # Send GET request to Caddy API
         conn.request('GET', api_path)
-
         resp = conn.getresponse()
         body = resp.read().decode('utf-8', errors='replace')
-        
         if resp.status == 200:
             config = loads(body)
             if app:
-                # If app is specified, extract just the server config for that app
                 app = sanitize_app_name(app)
                 if 'apps' in config and 'http' in config['apps']:
                     if 'servers' in config['apps']['http'] and app in config['apps']['http']['servers']:
@@ -507,6 +564,7 @@ def get_caddy_config(app=None):
             else:
                 return config  # Return full config
         else:
+            echo(f"Error: Caddy API returned status {resp.status} - {resp.reason}", fg='red')
             return None
     except Exception as e:
         echo(f"Error getting Caddy configuration: {e}", fg='red')
@@ -515,29 +573,25 @@ def get_caddy_config(app=None):
 def remove_caddy_config_for_app(app):
     """Remove Caddy configuration for an app using the admin API"""
     app = sanitize_app_name(app)
-    
+
     try:
         echo(f"-----> Removing Caddy configuration for app '{app}'", fg='yellow')
         conn = http.client.HTTPConnection('localhost', 2019, timeout=5)
-
-        # Set the API path using the app name as the site ID
         api_path = f"/config/apps/http/servers/{app}"
-
-        # Send DELETE request to Caddy API
         conn.request('DELETE', api_path)
-
         resp = conn.getresponse()
         resp.read()  # Consume the response body
-        
         if resp.status in (200, 204):
             echo(f"-----> Successfully removed Caddy configuration for app '{app}'", fg='green')
             return True
         else:
-            echo(f"Warning: Failed to remove Caddy configuration for app '{app}': {resp.status} {resp.reason}", fg='yellow')
+            echo(f"Warning: Failed to remove Caddy configuration for app '{app}'", fg='yellow')
             return False
     except Exception as e:
         echo(f"Error removing Caddy configuration: {e}", fg='red')
         return False
+    finally:
+        pass
 
 
 # === Utility functions ===
@@ -700,11 +754,11 @@ def do_deploy(app, deltas={}, newrev=None):
             makedirs(log_path)
         workers = parse_procfile(procfile)
         caddy_json_path = join(app_path, 'caddy.json')
-        
+
         # Add a virtual 'static' worker if we have caddy.json but no workers from Procfile
         if (not workers or len(workers) == 0) and exists(caddy_json_path):
             workers = {"static": "echo 'Static site via Caddy'"}
-            
+
         if workers and len(workers) > 0:
             settings = {}
 
@@ -916,7 +970,7 @@ def spawn_app(app, deltas={}):
     caddy_json_path = join(app_path, 'caddy.json')
     dockerfile_path = join(app_path, 'Dockerfile')
     compose_path = join(app_path, 'docker-compose.yaml')
-    
+
     workers = parse_procfile(procfile)
     workers.pop("preflight", None)
     workers.pop("release", None)
@@ -992,7 +1046,7 @@ def spawn_app(app, deltas={}):
 
     # Check whether we need to configure Caddy
     needs_caddy = 'web' in workers or 'static' in workers or exists(caddy_json_path)
-    
+
     if needs_caddy:
         echo("-----> Configuring web application", fg='green')
 
@@ -1505,10 +1559,10 @@ def cmd_config_live(app):
 @command("config:caddy")
 def cmd_config_caddy():
     """Display complete Caddy configuration, e.g.: kata config:caddy"""
-    
+
     # Get the current Caddy configuration
     config = get_caddy_config()
-    
+
     if config:
         # Pretty print the JSON configuration
         echo("==== COMPLETE CADDY CONFIGURATION ====", fg='green')
@@ -1519,15 +1573,15 @@ def cmd_config_caddy():
 
 
 @command("config:caddy:app")
-@argument('app')
+@argument("app")
 def cmd_config_caddy_app(app):
     """Display Caddy configuration for an app, e.g.: kata config:caddy:app <app>"""
-    
+
     app = exit_if_invalid(app)
 
     # Get the current Caddy configuration for the app
     config = get_caddy_config(app)
-    
+
     if config:
         # Pretty print the JSON configuration, showing only relevant app section
         echo("==== CADDY CONFIGURATION FOR '{}' ====".format(app), fg='green')
@@ -1816,7 +1870,6 @@ def cmd_git_hook(app):
                 makedirs(data_path)
             call("git clone --quiet {} {}".format(repo_path, app), cwd=APP_ROOT, shell=True)
         do_deploy(app, newrev=newrev)
-
 
 @command("git-receive-pack")
 @argument('app')
