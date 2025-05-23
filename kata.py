@@ -14,9 +14,8 @@ from fcntl import fcntl, F_SETFL, F_GETFL
 from glob import glob
 from json import loads, dumps
 import http.client
-import os
 from multiprocessing import cpu_count
-from os import chmod, getgid, getuid, symlink, unlink, remove, stat, listdir, environ, makedirs, O_NONBLOCK
+from os import chmod, getgid, getuid, symlink, unlink, pathsep, remove, stat, listdir, environ, makedirs, O_NONBLOCK
 from os.path import abspath, basename, dirname, exists, getmtime, join, realpath, splitext, isdir
 from pwd import getpwuid
 from grp import getgrgid
@@ -811,13 +810,20 @@ def deploy_python(app, deltas={}):
         call('python3 -m venv {app:s}'.format(**locals()), cwd=ENV_ROOT, shell=True)
         first_time = True
 
-    activation_script = join(venv_path, 'bin', 'activate_this.py')
-    # Fix the typo: .red() → .read()
-    exec(open(activation_script).read(), dict(__file__=activation_script))
+    # Use environment variable approach instead of activate_this.py
+    venv_bin = join(venv_path, 'bin')
+    environ['PATH'] = venv_bin + pathsep + environ['PATH']
+    environ['VIRTUAL_ENV'] = venv_path
+    # Remove PYTHONHOME if it exists as it can interfere with the virtual environment
+    if 'PYTHONHOME' in environ:
+        del environ['PYTHONHOME']
+    
+    # Use the pip from the virtual environment
+    pip_path = join(venv_bin, 'pip')
 
     if first_time or getmtime(requirements) > getmtime(venv_path):
         echo("-----> Running pip for '{}'".format(app), fg='green')
-        call('pip install -r {}'.format(requirements), cwd=venv_path, shell=True)
+        call(f'{pip_path} install -r {requirements}', cwd=venv_path, shell=True)
     return spawn_app(app, deltas)
 
 

@@ -13,7 +13,7 @@ Kata is a tool for deploying and managing applications using systemd, Podman, an
 - `caddy`: 2.4 or later
 - `podman-compose`: 1.0 or later
 
-This means that Debian 13 (Trixie) or later is a requirement. Additionally, in `trixie` you should `systemctl enable caddy-api` to make sure Caddy is started with API config persistence.
+This means that Debian 13 (Trixie) or later is a requirement. Additionally, in `trixie` you should `systemctl enable caddy-api` to make sure Caddy is started with API config persistence and make sure to log in to the `kata` account using `sudo machinectl shell kata@` if you need to do some debugging.
 
 ## Caddy Configuration
 
