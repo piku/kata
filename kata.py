@@ -341,7 +341,6 @@ def get_worker_types(app):
         workers.append('compose')
     if exists(join(app_path, 'caddy.json')) and not workers:
         workers.append('static')
-
     return workers
 
 def validate_caddy_json(config):
@@ -364,7 +363,6 @@ def validate_caddy_json(config):
                 return False, "Each handler must be an object"
             if 'handler' not in handler:
                 return False, "Each handler must have a 'handler' field"
-
     return True, None
 
 def configure_caddy_for_app(app, env):
@@ -385,6 +383,7 @@ def configure_caddy_for_app(app, env):
         echo(f"Please check your caddy.json file for errors", fg='yellow')
         return False
 
+    # TODO: make sure we are handling PORT as an internal affair
     if 'PORT' not in env and not any(worker in ['container', 'compose'] for worker in get_worker_types(app)):
         echo(f"Error: PORT environment variable must be set for Caddy configuration", fg='red')
         return False
@@ -492,10 +491,6 @@ def remove_caddy_config_for_app(app):
             # Remove the app from the configuration, preserving everything else
             del current_config['apps']['http']['servers'][app]
 
-            # If servers is now empty, don't remove the structure completely
-            # This preserves other Caddy settings
-
-            # Apply the updated configuration
             config_data = dumps(current_config).encode('utf-8')
             conn = http.client.HTTPConnection('localhost', 2019, timeout=5)
             conn.request('POST', '/load', body=config_data,
@@ -517,7 +512,6 @@ def remove_caddy_config_for_app(app):
         return False
     finally:
         pass
-
 
 # === Utility functions ===
 
@@ -581,6 +575,10 @@ def parse_procfile(filename):
             if line.startswith("#") or not line:
                 continue
             try:
+                if ":" not in line:
+                    echo(f"Warning: missing colon separator in Procfile at line {line_number + 1}: '{line}'", fg='yellow')
+                    continue
+                
                 kind, command = map(lambda x: x.strip(), line.split(":", 1))
                 # Warn about deprecated worker types
                 if kind == 'wsgi':
@@ -596,8 +594,8 @@ def parse_procfile(filename):
                             if int(matches[i].replace("*/", "").replace("*", "1")) > limits[i]:
                                 raise ValueError
                 workers[kind] = command
-            except Exception:
-                echo("Warning: misformatted Procfile entry '{}' at line {}".format(line, line_number), fg='yellow')
+            except Exception as e:
+                echo(f"Warning: misformatted Procfile entry '{line}' at line {line_number + 1}", fg='yellow')
     if len(workers) == 0:
         return {}
     return workers
@@ -809,11 +807,13 @@ def deploy_python(app, deltas={}):
             makedirs(venv_path)
         except FileExistsError:
             echo("-----> Env dir already exists: '{}'".format(app), fg='yellow')
-        call('python -m venv {app:s}'.format(**locals()), cwd=ENV_ROOT, shell=True)
+        # Use python3 explicitly instead of python
+        call('python3 -m venv {app:s}'.format(**locals()), cwd=ENV_ROOT, shell=True)
         first_time = True
 
     activation_script = join(venv_path, 'bin', 'activate_this.py')
-    exec(open(activation_script).red(), dict(__file__=activation_script))
+    # Fix the typo: .red() → .read()
+    exec(open(activation_script).read(), dict(__file__=activation_script))
 
     if first_time or getmtime(requirements) > getmtime(venv_path):
         echo("-----> Running pip for '{}'".format(app), fg='green')
