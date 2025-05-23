@@ -972,26 +972,21 @@ def spawn_app(app, deltas={}):
     if needs_caddy:
         echo("-----> Configuring web application", fg='green')
 
-        # Error if PORT is not set for web applications (only needed for non-containerized apps)
         if 'PORT' not in env and not any(worker_type in ['container', 'compose'] for worker_type in workers.keys()):
             echo("Error: PORT environment variable must be set for web applications", fg='red')
             exit(1)
 
-        # Safe defaults for addressing
         for k, v in safe_defaults.items():
             if k not in env:
                 env[k] = v
 
-        # Configure Caddy using the API if a caddy.json file exists
         configure_caddy_for_app(app, env)
 
-        # Set app address for environment variables - only for web workers
         if 'web' in workers:
             app_address = "{BIND_ADDRESS:s}:{PORT:s}".format(**env)
-            echo("-----> App '{}' will listen on {}".format(app, app_address))
+            echo(f"-----> App '{app}' will listen on {app_address}", fg='green')
             env['APP_ADDRESS'] = app_address
 
-    # Configured worker count
     if exists(scaling):
         worker_count.update({k: int(v) for k, v in parse_procfile(scaling).items() if k in workers})
 
@@ -1042,15 +1037,15 @@ def spawn_app(app, deltas={}):
     # Remove unnecessary workers
     for k, v in to_destroy.items():
         for w in v:
-            unit_name = "{app:s}_{k:s}.{w:d}".format(**locals())
+            unit_name = "{app:s}_{k:s}.{w:d}"
             unit_file = join(USER_SYSTEMD_DIR, unit_name + '.service')
 
             if exists(unit_file):
-                echo("-----> Terminating '{app:s}:{k:s}.{w:d}'".format(**locals()), fg='yellow')
+                echo(f"-----> Terminating '{app:s}:{k:s}.{w:d}'", fg='yellow')
 
                 # Stop and disable the service
-                call('systemctl --user stop {}'.format(unit_name), shell=True)
-                call('systemctl --user disable {}'.format(unit_name), shell=True)
+                call(f'systemctl --user stop {unit_name}', shell=True)
+                call(f'systemctl --user disable {unit_name}', shell=True)
 
                 # Check if this is a container file
             is_container = unit_file.endswith('.service') and exists(unit_file.replace('.service', '.container'))
@@ -1068,8 +1063,6 @@ def spawn_app(app, deltas={}):
                 call('systemctl --user daemon-reload', shell=True)
             else:
                 # Remove the regular symlink and unit file
-                if exists(unit_link):
-                    unlink(unit_link)
                 if exists(unit_file):
                     unlink(unit_file)
 
@@ -1714,7 +1707,6 @@ def cmd_setup_caddy():
     echo("\nEnvironment variables like $PORT, $DOMAIN_NAME, etc. will be replaced with actual values.", fg="yellow")
     echo("Make sure to set PORT in your ENV file.\n", fg="yellow")
 
-
 @command("update")
 def cmd_update():
     """Update the kata server script"""
@@ -1729,9 +1721,8 @@ def cmd_update():
             copyfile(tempfile, KATA_SCRIPT)
             echo("Update successful.")
         else:
-            echo("Error updating kata - please check if {} is accessible from this machine.".format(KATA_RAW_SOURCE_URL))
+            echo(f"Error updating kata - please check if {KATA_RAW_SOURCE_URL} is accessible from this machine.", fg='red')
     echo("Done.")
-
 
 # --- Internal commands ---
 
@@ -1781,7 +1772,6 @@ cat | KATA_ROOT="{KATA_ROOT:s}" {KATA_SCRIPT:s} git-hook {app:s}""".format(**env
     # Handle the actual receive. We'll be called with 'git-hook' after it happens
     call('git-shell -c "{}" '.format(argv[1] + " '{}'".format(app)), cwd=GIT_ROOT, shell=True)
 
-
 @command("git-upload-pack")
 @argument('app')
 def cmd_git_upload_pack(app):
@@ -1792,13 +1782,11 @@ def cmd_git_upload_pack(app):
     # Handle the actual receive. We'll be called with 'git-hook' after it happens
     call('git-shell -c "{}" '.format(argv[1] + " '{}'".format(app)), cwd=GIT_ROOT, shell=True)
 
-
 @command("scp")
 @pass_context
 def cmd_scp(ctx):
     """Simple wrapper to allow scp to work."""
     call(" ".join(["scp"] + ctx["args"]), cwd=GIT_ROOT, shell=True)
-
 
 @command("help")
 def cmd_help():
