@@ -12,7 +12,7 @@ from importlib import import_module
 from collections import defaultdict, deque
 from fcntl import fcntl, F_SETFL, F_GETFL
 from glob import glob
-from json import loads, dumps
+from json import loads, dumps, JSONDecodeError
 import http.client
 from multiprocessing import cpu_count
 from os import chmod, getgid, getuid, symlink, unlink, pathsep, remove, stat, listdir, environ, makedirs, O_NONBLOCK
@@ -54,12 +54,17 @@ GIT_ROOT = abspath(join(KATA_ROOT, "repos"))
 LOG_ROOT = abspath(join(KATA_ROOT, "logs"))
 CADDY_ROOT = abspath(join(KATA_ROOT, "caddy"))
 CACHE_ROOT = abspath(join(KATA_ROOT, "cache"))
-SYSTEMD_ROOT = abspath(join(KATA_ROOT, "systemd"))
 PODMAN_ROOT = abspath(join(KATA_ROOT, "podman"))
 ACME_ROOT = environ.get('ACME_ROOT', join(environ['HOME'], '.acme.sh'))
 ACME_WWW = abspath(join(KATA_ROOT, "acme"))
 ACME_ROOT_CA = environ.get('ACME_ROOT_CA', 'letsencrypt.org')
 UNIT_PATTERN = "%s@%s.service"
+USER_SYSTEMD_DIR = join(environ['HOME'], '.config', 'systemd', 'user')
+QUADLET_DIR = join(USER_SYSTEMD_DIR, 'containers', 'systemd')
+
+# Set XDG_RUNTIME_DIR if not set (needed for systemd --user)
+if 'XDG_RUNTIME_DIR' not in environ:
+    environ['XDG_RUNTIME_DIR'] = f"/run/user/{getuid()}"
 
 # === Make sure we can access kata user-installed binaries === #
 
@@ -289,24 +294,23 @@ def load_caddy_json(app_path):
     caddy_json = join(app_path, 'caddy.json')
     if exists(caddy_json):
         try:
-            with open(caddy_json, 'r') as f:
-                echo(f"-----> Found caddy.json configuration", fg='green')
+            with open(caddy_json, 'r', encoding='utf-8') as f:
+                echo("-----> Found caddy.json configuration", fg='green')
                 json_content = f.read()
                 try:
                     return loads(json_content)
                 except Exception as json_error:
                     echo(f"Error parsing caddy.json: {json_error}", fg='red')
                     # Try to identify the location of the error
-                    import json
                     try:
-                        json.loads(json_content)
-                    except json.JSONDecodeError as detailed_error:
+                        loads(json_content)
+                    except JSONDecodeError as detailed_error:
                         echo(f"JSON syntax error at line {detailed_error.lineno}, column {detailed_error.colno}: {detailed_error.msg}", fg='yellow')
-                    echo(f"Make sure your caddy.json contains valid JSON", fg='yellow')
+                    echo("Make sure your caddy.json contains valid JSON", fg='yellow')
                     return None
         except Exception as e:
             echo(f"Error loading caddy.json for app: {e}", fg='red')
-            echo(f"Make sure your caddy.json file exists and is readable", fg='yellow')
+            echo("Make sure your caddy.json file exists and is readable", fg='yellow')
     return None
 
 def expand_env_in_json(json_obj, env):
@@ -373,18 +377,18 @@ def configure_caddy_for_app(app, env):
 
     if not config_json:
         echo(f"No caddy.json found for app '{app}', skipping Caddy configuration", fg='yellow')
-        echo(f"Add a caddy.json file to configure web routing for this app", fg='yellow')
+        echo("Add a caddy.json file to configure web routing for this app", fg='yellow')
         return False
 
     is_valid, error_message = validate_caddy_json(config_json)
     if not is_valid:
         echo(f"Error in caddy.json: {error_message}", fg='red')
-        echo(f"Please check your caddy.json file for errors", fg='yellow')
+        echo("Please check your caddy.json file for errors", fg='yellow')
         return False
 
     # TODO: make sure we are handling PORT as an internal affair
     if 'PORT' not in env and not any(worker in ['container', 'compose'] for worker in get_worker_types(app)):
-        echo(f"Error: PORT environment variable must be set for Caddy configuration", fg='red')
+        echo("Error: PORT environment variable must be set for Caddy configuration", fg='red')
         return False
     try:
         config_json = expand_env_in_json(config_json, env)
@@ -429,7 +433,7 @@ def configure_caddy_for_app(app, env):
         if resp.status in (200, 201, 204):
             echo(f"-----> Successfully configured Caddy for app '{app}'", fg='green')
             echo(f"-----> Use 'kata caddy:app {app}' to view the configuration", fg='green')
-            echo(f"-----> Use 'kata caddy' to view the complete Caddy configuration", fg='green')
+            echo("-----> Use 'kata caddy' to view the complete Caddy configuration", fg='green')
             return True
         else:
             echo(f"Warning: Caddy API configuration failed: {resp.status} {resp.reason}\n{body}", fg='yellow')
@@ -545,9 +549,9 @@ def get_boolean(value):
 
 def write_config(filename, bag, separator='='):
     """Helper for writing out config files"""
-    with open(filename, 'w') as h:
+    with open(filename, 'w', encoding='utf-8') as h:
         for k, v in bag.items():
-            h.write('{k:s}{separator:s}{v}\n'.format(**locals()))
+            h.write(f"{k:s}{separator:s}{v}\n")
 
 
 def setup_authorized_keys(ssh_fingerprint, script_path, pubkey):
@@ -556,8 +560,8 @@ def setup_authorized_keys(ssh_fingerprint, script_path, pubkey):
     if not exists(dirname(authorized_keys)):
         makedirs(dirname(authorized_keys))
     # Restrict features and force all SSH commands to go through our script
-    with open(authorized_keys, 'a') as h:
-        h.write("""command="FINGERPRINT={ssh_fingerprint:s} NAME=default {script_path:s} $SSH_ORIGINAL_COMMAND",no-agent-forwarding,no-user-rc,no-X11-forwarding,no-port-forwarding {pubkey:s}\n""".format(**locals()))
+    with open(authorized_keys, 'a', encoding='utf-8') as h:
+        h.write(f"""command="FINGERPRINT={ssh_fingerprint:s} NAME=default {script_path:s} $SSH_ORIGINAL_COMMAND",no-agent-forwarding,no-user-rc,no-X11-forwarding,no-port-forwarding {pubkey:s}\n""")
     chmod(dirname(authorized_keys), S_IRUSR | S_IWUSR | S_IXUSR)
     chmod(authorized_keys, S_IRUSR | S_IWUSR)
 
@@ -568,7 +572,7 @@ def parse_procfile(filename):
     if not exists(filename):
         return {}
 
-    with open(filename, 'r') as procfile:
+    with open(filename, 'r', encoding='utf-8') as procfile:
         for line_number, line in enumerate(procfile):
             line = line.strip()
             if line.startswith("#") or not line:
@@ -594,7 +598,7 @@ def parse_procfile(filename):
                                 raise ValueError
                 workers[kind] = command
             except Exception as e:
-                echo(f"Warning: misformatted Procfile entry '{line}' at line {line_number + 1}", fg='yellow')
+                echo(f"Warning: misformatted Procfile entry '{line}' at line {line_number + 1}: {e}", fg='yellow')
     if len(workers) == 0:
         return {}
     return workers
@@ -630,15 +634,15 @@ def parse_settings(filename, env={}):
             try:
                 k, v = map(lambda x: x.strip(), line.split("=", 1))
                 env[k] = expandvars(v, env)
-            except Exception:
-                echo("Error: malformed setting '{}', ignoring file.".format(line), fg='red')
+            except Exception as e:
+                echo(f"Error: malformed setting '{line}', ignoring file: {e}", fg='red')
                 return {}
     return env
 
 
 def check_requirements(binaries):
     """Checks if all the binaries exist and are executable"""
-    echo("-----> Checking requirements: {}".format(binaries), fg='green')
+    echo(f"-----> Checking requirements: {binaries}", fg='green')
     requirements = list(map(which, binaries))
     echo(str(requirements))
 
@@ -650,7 +654,7 @@ def check_requirements(binaries):
 
 def found_app(kind):
     """Helper function to output app detected"""
-    echo("-----> {} app detected.".format(kind), fg='green')
+    echo(f"-----> {kind} app detected.", fg='green')
     return True
 
 
@@ -666,10 +670,10 @@ def do_deploy(app, deltas={}, newrev=None):
 
     env = {'GIT_WORK_DIR': app_path}
     if exists(app_path):
-        echo("-----> Deploying app '{}'".format(app), fg='green')
+        echo(f"-----> Deploying app '{app}'", fg='green')
         call('git fetch --quiet', cwd=app_path, env=env, shell=True)
         if newrev:
-            call('git reset --hard {}'.format(newrev), cwd=app_path, env=env, shell=True)
+            call(f'git reset --hard {newrev}', cwd=app_path, env=env, shell=True)
         call('git submodule init', cwd=app_path, env=env, shell=True)
         call('git submodule update', cwd=app_path, env=env, shell=True)
         if not exists(log_path):
@@ -695,7 +699,7 @@ def do_deploy(app, deltas={}, newrev=None):
                 echo("-----> Running preflight.", fg='green')
                 retval = call(workers["preflight"], cwd=app_path, env=settings, shell=True)
                 if retval:
-                    echo("-----> Exiting due to preflight command error value: {}".format(retval))
+                    echo(f"-----> Exiting due to preflight command error value: {retval}")
                     exit(retval)
                 workers.pop("preflight", None)
 
@@ -780,9 +784,9 @@ def do_deploy(app, deltas={}, newrev=None):
                 echo("-----> No valid Procfile found, but caddy.json exists. Deploying as static site.", fg='yellow')
                 settings = spawn_app(app, deltas)
             else:
-                echo("Error: No valid Procfile, Dockerfile, docker-compose.yaml or caddy.json found for app '{}'.".format(app), fg='red')
+                echo(f"Error: No valid Procfile, Dockerfile, docker-compose.yaml or caddy.json found for app '{app}'.", fg='red')
     else:
-        echo("Error: app '{}' not found.".format(app), fg='red')
+        echo(f"Error: app '{app}' not found.", fg='red')
 
 
 def deploy_python(app, deltas={}):
@@ -801,13 +805,13 @@ def deploy_python(app, deltas={}):
 
     first_time = False
     if not exists(join(venv_path, "bin", "activate")):
-        echo("-----> Creating venv for '{}'".format(app), fg='green')
+        echo(f"-----> Creating venv for '{app}'", fg='green')
         try:
             makedirs(venv_path)
         except FileExistsError:
-            echo("-----> Env dir already exists: '{}'".format(app), fg='yellow')
+            echo(f"-----> Env dir already exists: '{app}'", fg='yellow')
         # Use python3 explicitly instead of python
-        call('python3 -m venv {app:s}'.format(**locals()), cwd=ENV_ROOT, shell=True)
+        call(f'python3 -m venv {app:s}', cwd=ENV_ROOT, shell=True)
         first_time = True
 
     # Use environment variable approach instead of activate_this.py
@@ -822,7 +826,7 @@ def deploy_python(app, deltas={}):
     pip_path = join(venv_bin, 'pip')
 
     if first_time or getmtime(requirements) > getmtime(venv_path):
-        echo("-----> Running pip for '{}'".format(app), fg='green')
+        echo(f"-----> Running pip for '{app}'", fg='green')
         call(f'{pip_path} install -r {requirements}', cwd=venv_path, shell=True)
     return spawn_app(app, deltas)
 
@@ -830,7 +834,7 @@ def deploy_python(app, deltas={}):
 def deploy_python_with_uv(app, deltas={}):
     """Deploy a Python application using Astral uv"""
 
-    echo("=====> Starting uv deployment for '{}'".format(app), fg='green')
+    echo(f"=====> Starting uv deployment for '{app}'", fg='green')
     env_file = join(APP_ROOT, app, 'ENV')
     venv_path = join(ENV_ROOT, app)
     # Set unbuffered output and readable UTF-8 mapping
@@ -859,15 +863,15 @@ def deploy_containerized(app, deltas={}):
     if exists(env_file):
         env.update(parse_settings(env_file, env))
 
-    echo("-----> Building container for '{}'".format(app), fg='green')
-    call('podman build -t {app:s} .'.format(**locals()), cwd=app_path, shell=True)
+    echo(f"-----> Building container for '{app}'", fg='green')
+    call(f'podman build -t {app} .', cwd=app_path, shell=True)
 
     # Ensure quadlet directory exists
     podman_dir = join(PODMAN_ROOT, app)
     if not exists(podman_dir):
         makedirs(podman_dir)
 
-    echo("-----> Setting up Podman Quadlet configuration for '{}'".format(app), fg='green')
+    echo(f"-----> Setting up Podman Quadlet configuration for '{app}'", fg='green')
 
     return spawn_app(app, deltas)
 
@@ -882,9 +886,7 @@ def deploy_compose(app, deltas={}):
     if exists(env_file):
         env.update(parse_settings(env_file, env))
 
-    echo("-----> Setting up podman-compose for '{}'".format(app), fg='green')
-    # Just prepare the environment, actual compose launch will be done through systemd
-
+    echo(f"-----> Setting up podman-compose for '{app}'", fg='green')
     return spawn_app(app, deltas)
 
 
@@ -900,7 +902,6 @@ def spawn_app(app, deltas={}):
     workers = parse_procfile(procfile)
     workers.pop("preflight", None)
     workers.pop("release", None)
-    ordinals = defaultdict(lambda: 1)
     worker_count = {k: 1 for k in workers.keys()}
 
     # Handle special cases where we don't have a Procfile or it's empty
@@ -928,15 +929,10 @@ def spawn_app(app, deltas={}):
             workers["static"] = "echo 'Static site via Caddy'"
             worker_count["static"] = 1
 
-    # the Python venv
     venv_path = join(ENV_ROOT, app)
-    # Settings shipped with the app
     env_file = join(APP_ROOT, app, 'ENV')
-    # Custom overrides
     settings = join(ENV_ROOT, app, 'ENV')
-    # Live settings
     live = join(ENV_ROOT, app, 'LIVE_ENV')
-    # Scaling
     scaling = join(ENV_ROOT, app, 'SCALING')
 
     # Bootstrap environment
@@ -1016,64 +1012,38 @@ def spawn_app(app, deltas={}):
     write_config(live, env)
     write_config(scaling, worker_count, ':')
 
-    # Create systemd directories if they don't exist
-    if not exists(SYSTEMD_ROOT):
-        makedirs(SYSTEMD_ROOT)
-
-    user_systemd_dir = join(environ['HOME'], '.config', 'systemd', 'user')
-    if not exists(user_systemd_dir):
-        makedirs(user_systemd_dir)
-
     # Create new workers
     for k, v in to_create.items():
         if k == "static":
             continue  # Skip static workers for systemd unit/symlink creation
         for w in v:
-            unit_name = "{app:s}_{k:s}.{w:d}".format(**locals())
-            unit_file = join(SYSTEMD_ROOT, unit_name + '.service')
-            unit_link = join(user_systemd_dir, unit_name + '.service')
-
-            if not exists(unit_file):
-                echo("-----> Spawning '{app:s}:{k:s}.{w:d}'".format(**locals()), fg='green')
-                spawn_worker(app, k, workers[k], env, w, unit_file)
-
-                # If it's a container file, we need special handling for quadlet
-                is_container = unit_file.endswith('.container')
-
-                # Create quadlet directory if needed
-                quadlet_dir = join(user_systemd_dir, 'containers', 'systemd')
-                if is_container and not exists(quadlet_dir):
-                    makedirs(quadlet_dir, exist_ok=True)
-
-                # Use appropriate destination for symlink
-                symlink_dest = unit_file
-                symlink_target = unit_link if not is_container else join(quadlet_dir, basename(unit_file))
-
-                # Create symlink to user systemd directory if it doesn't exist
-                if exists(symlink_target):
-                    try:
-                        unlink(symlink_target)
-                        echo(f"-----> Removed existing symlink: {symlink_target}", fg='yellow')
-                    except Exception as e:
-                        echo(f"Warning: Could not remove existing symlink {symlink_target}: {e}", fg='yellow')
-                symlink(symlink_dest, symlink_target)
-
-                # For container files, we need to run daemon-reload to generate the service
-                if is_container:
-                    call('systemctl --user daemon-reload', shell=True)
-                    # The actual service name is generated by podman
-                    unit_name = basename(unit_file).replace('.container', '.service')
-
-                # Enable and start the service
-                call('systemctl --user enable {}'.format(unit_name), shell=True)
-                call('systemctl --user start {}'.format(unit_name), shell=True)
+            unit_name = f"{app}_{k}.{w}"
+            echo(f"-----> Spawning '{app}:{k}.{w}'", fg='green')
+            final_unit = spawn_worker(app, k, workers[k], env, w)
+            
+            if final_unit:
+                # Get the basename of the unit file for systemctl commands
+                unit_name = basename(final_unit)
+                
+                # Set up environment variables for systemd
+                if 'XDG_RUNTIME_DIR' not in environ:
+                    environ['XDG_RUNTIME_DIR'] = f"/run/user/{getuid()}"
+                
+                # Reload systemd to recognize new units
+                call('systemctl --user daemon-reload', shell=True)
+                
+                # Enable and start the unit
+                echo(f"-----> Enabling service: {unit_name}", fg='green')
+                call(f'systemctl --user enable {unit_name}', shell=True)
+                
+                echo(f"-----> Starting service: {unit_name}", fg='green')
+                call(f'systemctl --user start {unit_name}', shell=True)
 
     # Remove unnecessary workers
     for k, v in to_destroy.items():
         for w in v:
             unit_name = "{app:s}_{k:s}.{w:d}".format(**locals())
-            unit_file = join(SYSTEMD_ROOT, unit_name + '.service')
-            unit_link = join(user_systemd_dir, unit_name + '.service')
+            unit_file = join(USER_SYSTEMD_DIR, unit_name + '.service')
 
             if exists(unit_file):
                 echo("-----> Terminating '{app:s}:{k:s}.{w:d}'".format(**locals()), fg='yellow')
@@ -1108,13 +1078,15 @@ def spawn_app(app, deltas={}):
 
 def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
     """Set up and deploy a single worker of a given kind using systemd"""
-
+    
     env['PROC_TYPE'] = kind
-    env_path = join(ENV_ROOT, app)
     app_path = join(APP_ROOT, app)
     log_file = join(LOG_ROOT, app, "{kind}.{ordinal}.log".format(**locals()))
     data_path = join(DATA_ROOT, app)
-
+    
+    # Construct unit name
+    unit_name = f"{app}_{kind}.{ordinal}"
+    
     log_dir = join(LOG_ROOT, app)
     if not exists(log_dir):
         makedirs(log_dir)
@@ -1125,13 +1097,12 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
         return
     elif kind.startswith('cron'):
         # For cron-like jobs, use systemd timer instead of service
-        timer_unit = unit_file.replace('.service', '.timer')
+        timer_unit = join(USER_SYSTEMD_DIR, f"{unit_name}.timer")
         # Parse the cron pattern from the command
         cron_parts = command.split(' ', 5)
         minute, hour, day, month, weekday, cmd = cron_parts
 
         # Convert cron pattern to systemd timer format
-        # This is a simplified conversion and might need enhancement for complex patterns
         weekday_str = ('Sat' if weekday == '6' else
                        'Sun' if weekday == '0' else
                        'Mon' if weekday == '1' else
@@ -1158,6 +1129,7 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
     # Check if this is a containerized app (Dockerfile present)
     containerized = exists(join(app_path, 'Dockerfile'))
     unit_content = ''
+    
     if containerized:
         # For containerized applications, use Podman Quadlet configuration
         container_name = f"{app}-{kind}-{ordinal}"
@@ -1166,8 +1138,8 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
         container_port = env.get('CONTAINER_PORT', host_port)
         app_name = app
 
-        # Create a .container file for quadlet instead of a direct systemd unit
-        quadlet_file = unit_file.replace('.service', '.container')
+        # Create a .container file in the quadlet directory
+        quadlet_file = join(QUADLET_DIR, f"{unit_name}.container")
 
         # Process additional volume mounts from environment
         extra_volumes = ""
@@ -1204,11 +1176,11 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
         with open(quadlet_file, 'w') as f:
             f.write(quadlet_content)
 
-        # The actual .service will be generated by the podman-systemd generator
-        unit_file = quadlet_file
+        # Return the created quadlet file
+        return quadlet_file
     else:
+        # Create regular systemd service file
         environment_vars = '\n'.join(['Environment="{}={}"'.format(k, v) for k, v in env.items()])
-
         unit_content = SYSTEMD_APP_TEMPLATE.format(
             app_name=app,
             process_type=kind,
@@ -1221,71 +1193,109 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
             command=command,
             log_path=log_file
         )
-
-    # Write the unit file
-    with open(unit_file, 'w') as f:
-        f.write(unit_content)
+        
+        # Write service file directly to systemd user directory
+        service_file = join(USER_SYSTEMD_DIR, f"{unit_name}.service")
+        with open(service_file, 'w') as f:
+            f.write(unit_content)
+        
+        # Return the created service file
+        return service_file
 
 
 def do_stop(app):
     """Stop an app by disabling its systemd services"""
-    app = sanitize_app_name(app)
-    user_systemd_dir = join(environ['HOME'], '.config', 'systemd', 'user')
-    quadlet_dir = join(user_systemd_dir, 'containers', 'systemd')
+    app = sanitize_app_name(app)    
+    units = glob(join(USER_SYSTEMD_DIR, f"{app}_*.service"))
+    timers = glob(join(USER_SYSTEMD_DIR, f"{app}_*.timer"))
+    container_files = glob(join(QUADLET_DIR, f"{app}_*.container"))
+    
 
-    units = glob(join(SYSTEMD_ROOT, '{}*.service'.format(app)))
-    container_files = glob(join(SYSTEMD_ROOT, '{}*.container'.format(app)))
-
-    if len(units) > 0 or len(container_files) > 0:
-        echo("Stopping app '{}'...".format(app), fg='yellow')
+    if len(units) > 0 or len(container_files) > 0 or len(timers) > 0:
+        echo(f"Stopping app '{app}'...", fg='yellow')
 
         # Handle standard service units
         for unit in units:
             unit_name = basename(unit)
-            call('systemctl --user stop {}'.format(unit_name), shell=True)
-            call('systemctl --user disable {}'.format(unit_name), shell=True)
-
-            unit_link = join(user_systemd_dir, unit_name)
-            if exists(unit_link):
-                unlink(unit_link)
+            echo(f"-----> Stopping and disabling: {unit_name}", fg='yellow')
+            call(f'systemctl --user stop {unit_name}', shell=True)
+            call(f'systemctl --user disable {unit_name}', shell=True)
+            
+            # Remove the unit file
+            try:
+                unlink(unit)
+                echo(f"-----> Removed unit file: {unit}", fg='green')
+            except Exception as e:
+                echo(f"Warning: Could not remove unit file {unit}: {e}", fg='yellow')
+                
+        # Handle timer units for cron jobs
+        for timer in timers:
+            timer_name = basename(timer)
+            service_name = timer_name.replace('.timer', '.service')
+            echo(f"-----> Stopping and disabling timer: {timer_name}", fg='yellow')
+            call(f'systemctl --user stop {timer_name}', shell=True)
+            call(f'systemctl --user disable {timer_name}', shell=True)
+            
+            # Remove the timer file
+            try:
+                unlink(timer)
+                echo(f"-----> Removed timer file: {timer}", fg='green')
+            except Exception as e:
+                echo(f"Warning: Could not remove timer file {timer}: {e}", fg='yellow')
+            
+            # Also remove the associated service if it exists
+            service_path = join(USER_SYSTEMD_DIR, service_name)
+            if exists(service_path):
+                try:
+                    unlink(service_path)
+                    echo(f"-----> Removed timer service file: {service_path}", fg='green')
+                except Exception as e:
+                    echo(f"Warning: Could not remove timer service file {service_path}: {e}", fg='yellow')
 
         # Handle quadlet container files
         for container_file in container_files:
             container_name = basename(container_file)
             service_name = container_name.replace('.container', '.service')
+            
+            echo(f"-----> Stopping and disabling container: {service_name}", fg='yellow')
+            call(f'systemctl --user stop {service_name}', shell=True)
+            call(f'systemctl --user disable {service_name}', shell=True)
+            
+            # Remove the container file
+            try:
+                unlink(container_file)
+                echo(f"-----> Removed container file: {container_file}", fg='green')
+            except Exception as e:
+                echo(f"Warning: Could not remove container file {container_file}: {e}", fg='yellow')
 
-            call('systemctl --user stop {}'.format(service_name), shell=True)
-            call('systemctl --user disable {}'.format(service_name), shell=True)
-
-            quadlet_link = join(quadlet_dir, container_name)
-            if exists(quadlet_link):
-                unlink(quadlet_link)
-
-            call('systemctl --user daemon-reload', shell=True)
+        # Reload systemd to recognize all the changes
+        call('systemctl --user daemon-reload', shell=True)
+        call('systemctl --user reset-failed', shell=True)
     else:
-        echo("Error: app '{}' not deployed or already stopped!".format(app), fg='red')
+        echo(f"Error: app '{app}' not deployed or already stopped!", fg='red')
 
 
 def do_restart(app):
     """Restarts a deployed app"""
     app = sanitize_app_name(app)
-    user_systemd_dir = join(environ['HOME'], '.config', 'systemd', 'user')
-
-    units = glob(join(SYSTEMD_ROOT, '{}*.service'.format(app)))
-    container_files = glob(join(SYSTEMD_ROOT, '{}*.container'.format(app)))
+    # Look only in standard locations
+    units = glob(join(USER_SYSTEMD_DIR, f"{app}_*.service"))
+    container_files = glob(join(QUADLET_DIR, f"{app}_*.container"))
 
     if len(units) > 0 or len(container_files) > 0:
-        echo("Restarting app '{}'...".format(app), fg='yellow')
+        echo(f"Restarting app '{app}'...", fg='yellow')
 
         for unit in units:
             unit_name = basename(unit)
-            call('systemctl --user restart {}'.format(unit_name), shell=True)
+            echo(f"-----> Restarting service: {unit_name}", fg='yellow')
+            call(f'systemctl --user restart {unit_name}', shell=True)
 
         for container_file in container_files:
             service_name = basename(container_file).replace('.container', '.service')
-            call('systemctl --user restart {}'.format(service_name), shell=True)
+            echo(f"-----> Restarting container: {service_name}", fg='yellow')
+            call(f'systemctl --user restart {service_name}', shell=True)
     else:
-        echo("Error: app '{}' not deployed!".format(app), fg='red')
+        echo(f"Error: app '{app}' not deployed!", fg='red')
         do_deploy(app)
 
 
@@ -1620,22 +1630,10 @@ def cmd_setup():
     echo("Running in Python {}".format(".".join(map(str, version_info))))
 
     # Create required paths
-    for p in [APP_ROOT, CACHE_ROOT, DATA_ROOT, GIT_ROOT, ENV_ROOT, SYSTEMD_ROOT, LOG_ROOT, CADDY_ROOT, PODMAN_ROOT, ACME_WWW]:
+    for p in [APP_ROOT, CACHE_ROOT, DATA_ROOT, GIT_ROOT, ENV_ROOT, USER_SYSTEMD_DIR, QUADLET_DIR, LOG_ROOT, CADDY_ROOT, PODMAN_ROOT, ACME_WWW]:
         if not exists(p):
             echo("Creating '{}'.".format(p), fg='green')
             makedirs(p)
-
-    # Create user systemd directory
-    user_systemd_dir = join(environ['HOME'], '.config', 'systemd', 'user')
-    if not exists(user_systemd_dir):
-        echo("Creating '{}'.".format(user_systemd_dir), fg='green')
-        makedirs(user_systemd_dir)
-
-    # Create systemd user quadlet directory
-    quadlet_dir = join(user_systemd_dir, 'containers', 'systemd')
-    if not exists(quadlet_dir):
-        echo("Creating quadlet directory '{}'.".format(quadlet_dir), fg='green')
-        makedirs(quadlet_dir)
 
     # Check for required binaries
     requirements = ['caddy', 'podman', 'podman-compose']
