@@ -59,8 +59,8 @@ ACME_ROOT = environ.get('ACME_ROOT', join(environ['HOME'], '.acme.sh'))
 ACME_WWW = abspath(join(KATA_ROOT, "acme"))
 ACME_ROOT_CA = environ.get('ACME_ROOT_CA', 'letsencrypt.org')
 UNIT_PATTERN = "%s@%s.service"
-USER_SYSTEMD_DIR = join(environ['HOME'], '.config', 'systemd', 'user')
-QUADLET_DIR = join(USER_SYSTEMD_DIR, 'containers', 'systemd')
+SYSTEMD_ROOT = join(environ['HOME'], '.config', 'systemd', 'user')
+QUADLET_ROOT = join(SYSTEMD_ROOT, 'containers', 'systemd')
 
 # Set XDG_RUNTIME_DIR if not set (needed for systemd --user)
 if 'XDG_RUNTIME_DIR' not in environ:
@@ -102,7 +102,7 @@ StandardError=append:{log_path}
 SyslogIdentifier={app_name}-{process_type}-{instance}
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
 """
 
 # Podman Quadlet template
@@ -125,7 +125,7 @@ Restart=always
 RestartSec=10
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
 """
 
 # Systemd timer template for cron jobs
@@ -617,7 +617,9 @@ def command_output(cmd):
     """executes a command and grabs its output, if any"""
     try:
         env = environ
-        return str(check_output(cmd, stderr=STDOUT, env=env, shell=True))
+        result = check_output(cmd, stderr=STDOUT, env=env, shell=True)
+        # Properly decode bytes to string
+        return result.decode('utf-8', errors='replace')
     except Exception:
         return ""
 
@@ -1038,7 +1040,7 @@ def spawn_app(app, deltas={}):
     for k, v in to_destroy.items():
         for w in v:
             unit_name = "{app:s}_{k:s}.{w:d}"
-            unit_file = join(USER_SYSTEMD_DIR, unit_name + '.service')
+            unit_file = join(SYSTEMD_ROOT, unit_name + '.service')
 
             if exists(unit_file):
                 echo(f"-----> Terminating '{app:s}:{k:s}.{w:d}'", fg='yellow')
@@ -1090,7 +1092,7 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
         return
     elif kind.startswith('cron'):
         # For cron-like jobs, use systemd timer instead of service
-        timer_unit = join(USER_SYSTEMD_DIR, f"{unit_name}.timer")
+        timer_unit = join(SYSTEMD_ROOT, f"{unit_name}.timer")
         # Parse the cron pattern from the command
         cron_parts = command.split(' ', 5)
         minute, hour, day, month, weekday, cmd = cron_parts
@@ -1132,7 +1134,7 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
         app_name = app
 
         # Create a .container file in the quadlet directory
-        quadlet_file = join(QUADLET_DIR, f"{unit_name}.container")
+        quadlet_file = join(QUADLET_ROOT, f"{unit_name}.container")
 
         # Process additional volume mounts from environment
         extra_volumes = ""
@@ -1188,7 +1190,7 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
         )
         
         # Write service file directly to systemd user directory
-        service_file = join(USER_SYSTEMD_DIR, f"{unit_name}.service")
+        service_file = join(SYSTEMD_ROOT, f"{unit_name}.service")
         with open(service_file, 'w') as f:
             f.write(unit_content)
         
@@ -1199,9 +1201,9 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
 def do_stop(app):
     """Stop an app by disabling its systemd services"""
     app = sanitize_app_name(app)    
-    units = glob(join(USER_SYSTEMD_DIR, f"{app}_*.service"))
-    timers = glob(join(USER_SYSTEMD_DIR, f"{app}_*.timer"))
-    container_files = glob(join(QUADLET_DIR, f"{app}_*.container"))
+    units = glob(join(SYSTEMD_ROOT, f"{app}_*.service"))
+    timers = glob(join(SYSTEMD_ROOT, f"{app}_*.timer"))
+    container_files = glob(join(QUADLET_ROOT, f"{app}_*.container"))
     
 
     if len(units) > 0 or len(container_files) > 0 or len(timers) > 0:
@@ -1237,7 +1239,7 @@ def do_stop(app):
                 echo(f"Warning: Could not remove timer file {timer}: {e}", fg='yellow')
             
             # Also remove the associated service if it exists
-            service_path = join(USER_SYSTEMD_DIR, service_name)
+            service_path = join(SYSTEMD_ROOT, service_name)
             if exists(service_path):
                 try:
                     unlink(service_path)
@@ -1272,8 +1274,8 @@ def do_restart(app):
     """Restarts a deployed app"""
     app = sanitize_app_name(app)
     # Look only in standard locations
-    units = glob(join(USER_SYSTEMD_DIR, f"{app}_*.service"))
-    container_files = glob(join(QUADLET_DIR, f"{app}_*.container"))
+    units = glob(join(SYSTEMD_ROOT, f"{app}_*.service"))
+    container_files = glob(join(QUADLET_ROOT, f"{app}_*.container"))
 
     if len(units) > 0 or len(container_files) > 0:
         echo(f"Restarting app '{app}'...", fg='yellow')
@@ -1525,18 +1527,85 @@ def cmd_destroy(app):
 
 @command("logs")
 @argument('app')
-@argument('process', nargs=1)
-def cmd_logs(app, process='*'):
-    """Tail running logs, e.g: kata logs <app> [<process>]"""
-
+def cmd_logs(app, process='*', follow=False, include_journal=True):
+    """Tail running logs, e.g: kata logs <app> [<process>]
+    
+    Use -f or --follow to follow logs in real-time.
+    """
     app = exit_if_invalid(app)
-
+    
+    # Parse arguments from app string if provided via SSH
+    if ' ' in app:
+        parts = app.split(' ')
+        app = sanitize_app_name(parts[0])
+        
+        # Check for flags and process name
+        for part in parts[1:]:
+            if part in ['-f', '--follow']:
+                follow = True
+            elif part.startswith('-'):
+                continue  # Skip other flags
+            else:
+                process = part
+    
+    # Define unit pattern for both modes
+    if process == '*':
+        unit_pattern = f"{app}_*.service"
+    else:
+        unit_pattern = f"{app}_{process}.*.service"
+    
+    # For following logs in real-time with journal
+    if follow and include_journal:
+        # Use a separate process to follow systemd logs
+        try:
+            echo(f"Following systemd journal logs for '{app}'...", fg='green')
+            cmd = f"journalctl --user -f -u {unit_pattern}"
+            journal_proc = Popen(cmd, shell=True)
+            
+            # Also follow regular log files
+            logfiles = glob(join(LOG_ROOT, app, process + '.*.log'))
+            if logfiles:
+                for line in multi_tail(app, logfiles):
+                    echo(line.strip(), fg='white')
+            
+            # Wait for user to interrupt
+            journal_proc.wait()
+            return
+        except KeyboardInterrupt:
+            return
+        except Exception as e:
+            echo(f"Error following logs: {str(e)}", fg='red')
+    
+    # Regular non-follow mode behavior
+    # Show journal logs first if enabled
+    if include_journal:
+        echo(f"-----> Systemd journal logs for '{app}'", fg='green')
+        try:
+            # Check if there are any matching units first
+            check_cmd = f"systemctl --user list-units {unit_pattern} --no-legend"
+            units_output = command_output(check_cmd)
+            
+            if units_output.strip():
+                echo(f"Found systemd units matching {unit_pattern}", fg='green')
+                cmd = f"journalctl --user -n 50 -u {unit_pattern}"
+                journal_output = command_output(cmd)
+                if journal_output.strip():
+                    echo(journal_output.strip(), fg='white')
+                else:
+                    echo("No recent journal logs found", fg='yellow')
+            else:
+                echo(f"No systemd units found matching {unit_pattern}", fg='yellow')
+        except Exception as e:
+            echo(f"Error retrieving systemd logs: {str(e)}", fg='red')
+    
+    # Then show file logs
+    echo(f"-----> File logs for '{app}'", fg='green')
     logfiles = glob(join(LOG_ROOT, app, process + '.*.log'))
     if len(logfiles) > 0:
         for line in multi_tail(app, logfiles):
             echo(line.strip(), fg='white')
     else:
-        echo("No logs found for app '{}'.".format(app), fg='yellow')
+        echo(f"No log files found for app '{app}' with process pattern '{process}'.", fg='yellow')
 
 
 @command("ps")
@@ -1623,7 +1692,7 @@ def cmd_setup():
     echo("Running in Python {}".format(".".join(map(str, version_info))))
 
     # Create required paths
-    for p in [APP_ROOT, CACHE_ROOT, DATA_ROOT, GIT_ROOT, ENV_ROOT, USER_SYSTEMD_DIR, QUADLET_DIR, LOG_ROOT, CADDY_ROOT, PODMAN_ROOT, ACME_WWW]:
+    for p in [APP_ROOT, CACHE_ROOT, DATA_ROOT, GIT_ROOT, ENV_ROOT, SYSTEMD_ROOT, QUADLET_ROOT, LOG_ROOT, CADDY_ROOT, PODMAN_ROOT, ACME_WWW]:
         if not exists(p):
             echo("Creating '{}'.".format(p), fg='green')
             makedirs(p)

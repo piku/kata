@@ -13,6 +13,14 @@ sudo apt install -y python3 python3-pip python3-venv git curl uidmap openssh-ser
 
 **Minimum Python Version:** Kata requires Python 3.10 or higher.
 
+### User and Group Setup
+Create a user and group for Kata. This user will run the applications deployed with Kata.
+
+```bash
+sudo adduser kata
+sudo loginctl enable-linger kata
+```
+
 ### Install Caddy
 
 Caddy is used as the web server. Follow the official Caddy documentation to install it, as it's typically not in the default Debian repositories. Instructions can usually be found at [https://caddyserver.com/docs/install](https://caddyserver.com/docs/install).
