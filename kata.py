@@ -8,17 +8,13 @@ try:
 except AssertionError:
     exit("Kata requires Python 3.12 or above")
 
-from importlib import import_module
-from collections import defaultdict, deque
+from collections import deque
 from fcntl import fcntl, F_SETFL, F_GETFL
 from glob import glob
 from json import loads, dumps, JSONDecodeError
 import http.client
-from multiprocessing import cpu_count
 from os import chmod, getgid, getuid, symlink, unlink, pathsep, remove, stat, listdir, environ, makedirs, O_NONBLOCK
 from os.path import abspath, basename, dirname, exists, getmtime, join, realpath, splitext, isdir
-from pwd import getpwuid
-from grp import getgrgid
 from re import sub, match
 from shlex import split as shsplit
 from shutil import copyfile, rmtree, which
@@ -29,8 +25,6 @@ from sys import argv, stdin, stdout, stderr, version_info, exit, path as sys_pat
 from tempfile import NamedTemporaryFile
 from time import sleep
 from traceback import format_exc
-from urllib.request import urlopen
-
 
 
 # === Make sure we can access all system and user binaries ===
@@ -1882,11 +1876,11 @@ def cmd_setup_ssh(public_key_file):
         if exists(key_file):
             try:
                 fingerprint = str(check_output('ssh-keygen -lf ' + key_file, shell=True)).split(' ', 4)[1]
-                key = open(key_file, 'r').read().strip()
-                echo("Adding key '{}'.".format(fingerprint), fg='white')
+                key = open(key_file, 'r', encoding='utf-8').read().strip()
+                echo(f"Adding key '{fingerprint}'.", fg='white')
                 setup_authorized_keys(fingerprint, KATA_SCRIPT, key)
             except Exception:
-                echo("Error: invalid public key file '{}': {}".format(key_file, format_exc()), fg='red')
+                echo(f"Error: invalid public key file '{key_file}': {format_exc()}", fg='red')
         elif public_key_file == '-':
             buffer = "".join(stdin.readlines())
             with NamedTemporaryFile(mode="w") as f:
@@ -1978,7 +1972,7 @@ def cmd_git_receive_pack(app):
         makedirs(dirname(hook_path))
         # Initialize the repository with a hook to this script
         call("git init --quiet --bare " + app, cwd=GIT_ROOT, shell=True)
-        with open(hook_path, 'w') as h:
+        with open(hook_path, 'w', encoding='utf-8') as h:
             h.write("""#!/usr/bin/env bash
 set -e; set -o pipefail;
 cat | KATA_ROOT="{KATA_ROOT:s}" {KATA_SCRIPT:s} git-hook {app:s}""".format(**env))
