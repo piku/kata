@@ -1106,27 +1106,35 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
         cron_parts = command.split(' ', 5)
         minute, hour, day, month, weekday, cmd = cron_parts
 
-        # Convert cron pattern to systemd timer format
-        weekday_str = ('Sat' if weekday == '6' else
-                       'Sun' if weekday == '0' else
-                       'Mon' if weekday == '1' else
-                       'Tue' if weekday == '2' else
-                       'Wed' if weekday == '3' else
-                       'Thu' if weekday == '4' else
-                       'Fri' if weekday == '5' else '*')
-
-        month_str = month if month != '*' else '*'
-        day_str = day if day != '*' else '*'
-        hour_str = hour if hour != '*' else '*'
-        minute_str = minute if minute != '*' else '*'
-        calendar_spec = f"{weekday_str} {month_str} {day_str} {hour_str} {minute_str}"
+        # Map numeric weekdays to their names for systemd
+        weekday_map = {
+            '0': 'Sun', '1': 'Mon', '2': 'Tue', '3': 'Wed', 
+            '4': 'Thu', '5': 'Fri', '6': 'Sat'
+        }
+        
+        # Format the calendar specification according to systemd's OnCalendar format
+        if weekday != '*':
+            # If weekday is specified, use the weekday format
+            weekday_str = weekday_map.get(weekday, weekday)
+            if day != '*' or month != '*':
+                # Both weekday and specific date - systemd requires both conditions
+                date_str = f"*-{month if month != '*' else '*'}-{day if day != '*' else '*'}"
+                calendar_spec = f"{weekday_str} {date_str} {hour}:{minute.zfill(2)}:00"
+            else:
+                # Only weekday is specified
+                calendar_spec = f"{weekday_str} *-*-* {hour}:{minute.zfill(2)}:00"
+        else:
+            # No weekday specified, use date format
+            date_str = f"*-{month if month != '*' else '*'}-{day if day != '*' else '*'}"
+            calendar_spec = f"{date_str} {hour}:{minute.zfill(2)}:00"
+        
         timer_content = SYSTEMD_TIMER_TEMPLATE.format(
             app_name=app,
             process_type=kind,
             calendar_spec=calendar_spec
         )
 
-        with open(timer_unit, 'w') as f:
+        with open(timer_unit, 'w', encoding='utf-8') as f:
             f.write(timer_content)
         command = cmd
 
