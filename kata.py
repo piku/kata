@@ -89,8 +89,6 @@ Description=Kata app: {app_name} - {process_type} {instance}
 After=network.target
 
 [Service]
-User={user}
-Group={group}
 WorkingDirectory={app_path}
 Environment="PORT={port}"
 {environment_vars}
@@ -1078,6 +1076,17 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
     app_path = join(APP_ROOT, app)
     log_file = join(LOG_ROOT, app, "{kind}.{ordinal}.log".format(**locals()))
     data_path = join(DATA_ROOT, app)
+    venv_path = join(ENV_ROOT, app)
+    
+    # Ensure PATH has virtualenv bin directory at the front
+    if 'PATH' not in env:
+        env['PATH'] = join(venv_path, 'bin') + ':' + environ['PATH']
+    elif join(venv_path, 'bin') not in env['PATH']:
+        env['PATH'] = join(venv_path, 'bin') + ':' + env['PATH']
+    
+    # Make sure virtualenv is set
+    if 'VIRTUAL_ENV' not in env:
+        env['VIRTUAL_ENV'] = venv_path
     
     # Construct unit name
     unit_name = f"{app}_{kind}.{ordinal}"
@@ -1123,7 +1132,6 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
 
     # Check if this is a containerized app (Dockerfile present)
     containerized = exists(join(app_path, 'Dockerfile'))
-    unit_content = ''
     
     if containerized:
         # For containerized applications, use Podman Quadlet configuration
@@ -1168,24 +1176,64 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
         )
 
         # Write the quadlet file
-        with open(quadlet_file, 'w') as f:
+        with open(quadlet_file, 'w', encoding='utf-8') as f:
             f.write(quadlet_content)
 
         # Return the created quadlet file
         return quadlet_file
     else:
         # Create regular systemd service file
+        # Explicitly include the full PATH environment variable to ensure commands are found
         environment_vars = '\n'.join(['Environment="{}={}"'.format(k, v) for k, v in env.items()])
+        # Make sure PATH is explicitly included in environment_vars if not already
+        if 'PATH=' not in environment_vars:
+            environment_vars += '\nEnvironment="PATH={}"'.format(env['PATH'])
+        
+        # Convert command to use absolute path for the executable
+        abs_command = command
+        if ' ' in command:
+            # Command has arguments - split to get the executable name
+            cmd_parts = command.split(' ', 1)
+            cmd_executable = cmd_parts[0]
+            cmd_args = cmd_parts[1]
+            
+            # Create a custom environment with the proper PATH for which
+            custom_env = environ.copy()
+            custom_env['PATH'] = env['PATH']
+            
+            # Find the absolute path using the proper PATH (including virtualenv)
+            try:
+                # Use subprocess to find the absolute path with the correct environment
+                abs_executable = command_output(f"which {cmd_executable}").strip()
+                if abs_executable:
+                    echo(f"-----> Using absolute path for command: {abs_executable} {cmd_args}", fg='green')
+                    abs_command = f"{abs_executable} {cmd_args}"
+                else:
+                    echo(f"Warning: Could not find absolute path for '{cmd_executable}'. Using as is.", fg='yellow')
+            except Exception as e:
+                echo(f"Warning: Error finding absolute path for '{cmd_executable}': {e}", fg='yellow')
+        else:
+            # Simple command with no arguments
+            custom_env = environ.copy()
+            custom_env['PATH'] = env['PATH']
+            try:
+                abs_executable = command_output(f"which {command}").strip()
+                if abs_executable:
+                    echo(f"-----> Using absolute path for command: {abs_executable}", fg='green')
+                    abs_command = abs_executable
+                else:
+                    echo(f"Warning: Could not find absolute path for '{command}'. Using as is.", fg='yellow')
+            except Exception as e:
+                echo(f"Warning: Error finding absolute path for '{command}': {e}", fg='yellow')
+        
         unit_content = SYSTEMD_APP_TEMPLATE.format(
             app_name=app,
             process_type=kind,
             instance=ordinal,
-            user=getpwuid(getuid()).pw_name,
-            group=getgrgid(getgid()).gr_name,
             app_path=app_path,
             port=env.get('PORT', '8000'),
             environment_vars=environment_vars,
-            command=command,
+            command=abs_command,  # Use the command with absolute path
             log_path=log_file
         )
         
@@ -1527,85 +1575,155 @@ def cmd_destroy(app):
 
 @command("logs")
 @argument('app')
-def cmd_logs(app, process='*', follow=False, include_journal=True):
-    """Tail running logs, e.g: kata logs <app> [<process>]
+def cmd_logs(app, process='*', follow=False, include_journal=True, startup_only=False):
+    """View application logs, e.g: kata logs <app> [<process>]
     
     Use -f or --follow to follow logs in real-time.
+    Use -s or --startup to show only startup/error logs.
     """
     app = exit_if_invalid(app)
+    
+    # Debug what we received (uncomment to troubleshoot)
+    # echo(f"DEBUG: Received app argument: '{app}'", fg='yellow')
     
     # Parse arguments from app string if provided via SSH
     if ' ' in app:
         parts = app.split(' ')
         app = sanitize_app_name(parts[0])
         
-        # Check for flags and process name
+        # First non-flag argument after app name is the process name
+        process_set = False
         for part in parts[1:]:
             if part in ['-f', '--follow']:
                 follow = True
+            elif part in ['-s', '--startup']:
+                startup_only = True
             elif part.startswith('-'):
                 continue  # Skip other flags
-            else:
+            elif not process_set:  # Only set process once
                 process = part
+                process_set = True
+                # Add explicit debug output
+                echo(f"Setting process filter to: '{process}'", fg='green')
     
-    # Define unit pattern for both modes
+    # Define unit pattern for both modes - use exact pattern for process
     if process == '*':
         unit_pattern = f"{app}_*.service"
+        log_pattern = f"{process}.*.log"
     else:
+        # For exact process matching, be specific about the service pattern
         unit_pattern = f"{app}_{process}.*.service"
+        log_pattern = f"{process}.*.log"
     
-    # For following logs in real-time with journal
-    if follow and include_journal:
-        # Use a separate process to follow systemd logs
-        try:
-            echo(f"Following systemd journal logs for '{app}'...", fg='green')
-            cmd = f"journalctl --user -f -u {unit_pattern}"
-            journal_proc = Popen(cmd, shell=True)
-            
-            # Also follow regular log files
-            logfiles = glob(join(LOG_ROOT, app, process + '.*.log'))
-            if logfiles:
-                for line in multi_tail(app, logfiles):
-                    echo(line.strip(), fg='white')
-            
-            # Wait for user to interrupt
-            journal_proc.wait()
-            return
-        except KeyboardInterrupt:
-            return
-        except Exception as e:
-            echo(f"Error following logs: {str(e)}", fg='red')
+    # Add debug output to confirm pattern
+    echo(f"Looking for systemd units matching: {unit_pattern}", fg='green')
     
-    # Regular non-follow mode behavior
-    # Show journal logs first if enabled
-    if include_journal:
-        echo(f"-----> Systemd journal logs for '{app}'", fg='green')
+    # For follow mode, we need special handling
+    if follow:
+        echo(f"-----> Following logs for '{app}' worker '{process}'", fg='green')
+        
+        # Get the log files
+        logfiles = glob(join(LOG_ROOT, app, f"{process}.*.log"))
+        
+        # Start a background process for journalctl if needed
+        journal_proc = None
+        if include_journal:
+            try:
+                check_cmd = f"systemctl --user list-units {unit_pattern} --no-legend"
+                units_output = command_output(check_cmd)
+                
+                if units_output.strip():
+                    echo(f"-----> Following systemd journal logs", fg='green')
+                    journal_cmd = f"journalctl --user -f -u {unit_pattern}"
+                    journal_proc = Popen(journal_cmd, shell=True)
+            except Exception as e:
+                echo(f"Error starting journal follow: {str(e)}", fg='red')
+        
+        # Now follow the log files if they exist
+        if logfiles:
+            try:
+                echo(f"-----> Following file logs", fg='green')
+                try:
+                    # Use an infinite loop since multi_tail is a generator
+                    for line in multi_tail(app, logfiles):
+                        echo(line.strip(), fg='white')
+                except KeyboardInterrupt:
+                    # Stop the journal process if it's running
+                    if journal_proc:
+                        journal_proc.terminate()
+                    echo("\nStopped following logs", fg='yellow')
+                    return
+            finally:
+                # Make sure to clean up
+                if journal_proc:
+                    journal_proc.terminate()
+        else:
+            # If no log files, just wait on the journal process
+            if journal_proc:
+                try:
+                    journal_proc.wait()
+                except KeyboardInterrupt:
+                    journal_proc.terminate()
+                    echo("\nStopped following logs", fg='yellow')
+            else:
+                echo("No logs found to follow.", fg='yellow')
+        return
+        
+    # Non-follow mode (startup/journal logs)
+    if startup_only or include_journal:
+        echo(f"-----> Startup logs for '{app}' worker '{process}'", fg='green')
         try:
-            # Check if there are any matching units first
-            check_cmd = f"systemctl --user list-units {unit_pattern} --no-legend"
-            units_output = command_output(check_cmd)
+            # Get a list of all matching units with direct glob instead of parsing systemctl output
+            units = glob(join(SYSTEMD_ROOT, unit_pattern))
             
-            if units_output.strip():
-                echo(f"Found systemd units matching {unit_pattern}", fg='green')
-                cmd = f"journalctl --user -n 50 -u {unit_pattern}"
-                journal_output = command_output(cmd)
-                if journal_output.strip():
-                    echo(journal_output.strip(), fg='white')
-                else:
-                    echo("No recent journal logs found", fg='yellow')
+            if units:
+                # Show what we found
+                echo(f"Found {len(units)} matching systemd units", fg='green')
+                # Just use the basenames of the files as the unit names
+                unit_names = [basename(unit) for unit in units]
+                
+                # For each unit, show its status and recent logs
+                for unit_name in unit_names:
+                    # Get unit status
+                    status_cmd = f"systemctl --user status {unit_name} --no-pager"
+                    status_output = command_output(status_cmd)
+                    
+                    echo(f"\n=== LOGS FOR {unit_name} ===", fg='green')
+                    
+                    if "Failed" in status_output or "error" in status_output.lower():
+                        echo(f"SERVICE STATUS:", fg='yellow')
+                        # Extract and show the specific error
+                        for line in status_output.split('\n'):
+                            if "Failed" in line or "error" in line.lower():
+                                echo(line.strip(), fg='red')
+                    
+                    # Get journal logs for this unit
+                    log_cmd = f"journalctl --user -u {unit_name} --no-pager -n 25"
+                    # Add flags to get more startup info
+                    if startup_only:
+                        log_cmd += " -p err..emerg"  # Only show error, critical, alert, and emergency messages
+                    
+                    journal_output = command_output(log_cmd)
+                    if journal_output.strip():
+                        echo(f"JOURNAL LOGS:", fg='yellow')
+                        echo(journal_output.strip(), fg='white')
+                    else:
+                        echo("No journal logs found for this unit", fg='yellow')
             else:
                 echo(f"No systemd units found matching {unit_pattern}", fg='yellow')
         except Exception as e:
             echo(f"Error retrieving systemd logs: {str(e)}", fg='red')
     
-    # Then show file logs
-    echo(f"-----> File logs for '{app}'", fg='green')
-    logfiles = glob(join(LOG_ROOT, app, process + '.*.log'))
-    if len(logfiles) > 0:
-        for line in multi_tail(app, logfiles):
-            echo(line.strip(), fg='white')
-    else:
-        echo(f"No log files found for app '{app}' with process pattern '{process}'.", fg='yellow')
+    # If not just looking for startup errors, show regular file logs
+    if not startup_only:
+        echo(f"\n-----> File logs for '{app}' worker '{process}'", fg='green')
+        logfiles = glob(join(LOG_ROOT, app, log_pattern))
+        if len(logfiles) > 0:
+            echo(f"Found {len(logfiles)} matching log files", fg='green')
+            for line in multi_tail(app, logfiles):
+                echo(line.strip(), fg='white')
+        else:
+            echo(f"No log files found for app '{app}' with process pattern '{process}'.", fg='yellow')
 
 
 @command("ps")
