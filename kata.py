@@ -574,7 +574,7 @@ def parse_procfile(filename):
                     echo(f"Warning: missing colon separator in Procfile at line {line_number + 1}: '{line}'", fg='yellow')
                     continue
                 
-                kind, command = map(lambda x: x.strip(), line.split(":", 1))
+                kind, cmd = map(lambda x: x.strip(), line.split(":", 1))
                 # Warn about deprecated worker types
                 if kind == 'wsgi':
                     echo("Warning: 'wsgi' worker type is deprecated. Please use 'web' instead.", fg='yellow')
@@ -582,13 +582,13 @@ def parse_procfile(filename):
                 # Check for cron patterns
                 if kind.startswith("cron"):
                     limits = [59, 24, 31, 12, 7]
-                    res = match(r"^((?:(?:\*\/)?\d+)|\*) ((?:(?:\*\/)?\d+)|\*) ((?:(?:\*\/)?\d+)|\*) ((?:(?:\*\/)?\d+)|\*) ((?:(?:\*\/)?\d+)|\*) (.*)$", command)
+                    res = match(r"^((?:(?:\*\/)?\d+)|\*) ((?:(?:\*\/)?\d+)|\*) ((?:(?:\*\/)?\d+)|\*) ((?:(?:\*\/)?\d+)|\*) ((?:(?:\*\/)?\d+)|\*) (.*)$", cmd)
                     if res:
                         matches = res.groups()
                         for i in range(len(limits)):
                             if int(matches[i].replace("*/", "").replace("*", "1")) > limits[i]:
                                 raise ValueError
-                workers[kind] = command
+                workers[kind] = cmd
             except Exception as e:
                 echo(f"Warning: misformatted Procfile entry '{line}' at line {line_number + 1}: {e}", fg='yellow')
     if len(workers) == 0:
