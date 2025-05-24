@@ -1102,6 +1102,8 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
     elif kind.startswith('cron'):
         # For cron-like jobs, use systemd timer instead of service
         timer_unit = join(SYSTEMD_ROOT, f"{unit_name}.timer")
+        service_unit = join(SYSTEMD_ROOT, f"{unit_name}.service")
+        
         # Parse the cron pattern from the command
         cron_parts = command.split(' ', 5)
         minute, hour, day, month, weekday, cmd = cron_parts
@@ -1128,16 +1130,34 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
             date_str = f"*-{month if month != '*' else '*'}-{day if day != '*' else '*'}"
             calendar_spec = f"{date_str} {hour}:{minute.zfill(2)}:00"
         
+        # Create timer using the template - add Unit directive to point to our service
         timer_content = SYSTEMD_TIMER_TEMPLATE.format(
             app_name=app,
             process_type=kind,
             calendar_spec=calendar_spec
-        )
+        ).replace("[Timer]", "[Timer]\nUnit={}.service".format(unit_name))
 
+        # Create a oneshot service that won't restart
+        service_content = SYSTEMD_APP_TEMPLATE.format(
+            app_name=app,
+            process_type=kind,
+            instance=ordinal,
+            app_path=app_path,
+            port=env.get('PORT', '8000'),
+            environment_vars='\n'.join(['Environment="{}={}"'.format(k, v) for k, v in env.items()]),
+            command=cmd,
+            log_path=log_file
+        ).replace("Restart=always", "Type=oneshot\nRemainAfterExit=no")
+
+        # Write both files
         with open(timer_unit, 'w', encoding='utf-8') as f:
             f.write(timer_content)
-        command = cmd
-
+        
+        with open(service_unit, 'w', encoding='utf-8') as f:
+            f.write(service_content)
+        
+        # Return the timer unit so it will be properly enabled
+        return timer_unit
     # Check if this is a containerized app (Dockerfile present)
     containerized = exists(join(app_path, 'Dockerfile'))
     
