@@ -718,16 +718,16 @@ def do_deploy(app, deltas={}, newrev=None):
                 and found_app("Static")
             ):
                 # Only static worker(s) present
-                settings.update(spawn_app(app, deltas))
+                settings.update(setup_app(app, deltas))
                 deployed = True
             # If static worker is present, always (re)generate Caddy config for static assets
             if 'static' in workers and not deployed:
-                settings.update(spawn_app(app, deltas))
+                settings.update(setup_app(app, deltas))
                 deployed = True
             if not deployed:
                 if exists(caddy_json):
                     echo("-----> Detected static site with caddy.json", fg='green')
-                    settings.update(spawn_app(app, deltas))
+                    settings.update(setup_app(app, deltas))
                     deployed = True
                 # Check for containerized apps
                 elif exists(dockerfile_path) and found_app("Containerized") and check_requirements(['podman']):
@@ -776,7 +776,7 @@ def do_deploy(app, deltas={}, newrev=None):
             # Check if there's a caddy.json file even though Procfile is invalid/empty
             elif exists(caddy_json):
                 echo("-----> No valid Procfile found, but caddy.json exists. Deploying as static site.", fg='yellow')
-                settings = spawn_app(app, deltas)
+                settings = setup_app(app, deltas)
             else:
                 echo(f"Error: No valid Procfile, Dockerfile, docker-compose.yaml or caddy.json found for app '{app}'.", fg='red')
     else:
@@ -822,7 +822,7 @@ def deploy_python(app, deltas={}):
     if first_time or getmtime(requirements) > getmtime(venv_path):
         echo(f"-----> Running pip for '{app}'", fg='green')
         call(f'{pip_path} install -r {requirements}', cwd=venv_path, shell=True)
-    return spawn_app(app, deltas)
+    return setup_app(app, deltas)
 
 
 def deploy_python_with_uv(app, deltas={}):
@@ -844,7 +844,7 @@ def deploy_python_with_uv(app, deltas={}):
     echo("-----> Calling uv sync", fg='green')
     call('uv sync --python-preference only-system', cwd=join(APP_ROOT, app), env=env, shell=True)
 
-    return spawn_app(app, deltas)
+    return setup_app(app, deltas)
 
 
 def deploy_containerized(app, deltas={}):
@@ -867,7 +867,7 @@ def deploy_containerized(app, deltas={}):
 
     echo(f"-----> Setting up Podman Quadlet configuration for '{app}'", fg='green')
 
-    return spawn_app(app, deltas)
+    return setup_app(app, deltas)
 
 
 def deploy_compose(app, deltas={}):
@@ -881,10 +881,10 @@ def deploy_compose(app, deltas={}):
         env.update(parse_settings(env_file, env))
 
     echo(f"-----> Setting up podman-compose for '{app}'", fg='green')
-    return spawn_app(app, deltas)
+    return setup_app(app, deltas)
 
 
-def spawn_app(app, deltas={}):
+def setup_app(app, deltas={}):
     """Create all workers for an app using systemd units and Caddy"""
 
     app_path = join(APP_ROOT, app)
@@ -907,7 +907,7 @@ def spawn_app(app, deltas={}):
             # If we also have caddy.json, mention it will be used for web routing
             if exists(caddy_json):
                 echo("-----> Found caddy.json, will configure web routing for containerized app", fg='green')
-                # Default port will be set in spawn_app
+                # Default port will be set in setup_app
         # For compose apps without Procfile, add a system worker (not web)
         elif exists(compose_path):
             echo("-----> No Procfile found, but docker-compose.yaml exists. Using compose deployment.", fg='yellow')
@@ -916,7 +916,7 @@ def spawn_app(app, deltas={}):
             # If we also have caddy.json, mention it will be used for web routing
             if exists(caddy_json):
                 echo("-----> Found caddy.json, will configure web routing for compose app", fg='green')
-                # Default port will be set in spawn_app
+                # Default port will be set in setup_app
         # Add a virtual 'static' worker if we have only caddy.json but no container/compose files
         elif exists(caddy_json):
             echo("-----> No Procfile found, but caddy.json exists. Treating as static site.", fg='yellow')
@@ -1009,7 +1009,7 @@ def spawn_app(app, deltas={}):
             unit_name = f"{app}_{k}.{w}"
             echo(f"-----> Spawning '{app}:{k}.{w}'", fg='green')
             
-            for unit in spawn_worker(app, k, workers[k], env, w):
+            for unit in setup_worker(app, k, workers[k], env, w):
                 # Get the basename of the unit file for systemctl commands
                 unit_name = basename(unit)
                 
@@ -1104,12 +1104,30 @@ def resolve_command_path(command, env_path):
         return command
 
 
-def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None) -> list:
-    """Set up and deploy a single worker of a given kind using systemd"""
+def setup_worker(app, kind, command, env, ordinal=1):
+    """
+    Create a systemd service unit for a worker process.
+    Returns a list of unit files created (paths) that should be enabled and started.
+    Different worker types are handled by specialized functions.
+    """
+    # Normalize inputs
+    app = sanitize_app_name(app)
     
+    # Dispatch to the appropriate specialized function based on worker type
+    if kind.startswith('cron'):
+        return setup_cron_worker(app, kind, command, env, ordinal)
+    elif kind == 'container':
+        return setup_container_worker(app, kind, command, env, ordinal)
+    else:
+        # Default case: regular worker
+        return setup_regular_worker(app, kind, command, env, ordinal)
+
+
+def setup_worker_environment(app, kind, env, ordinal=1):
+    """Set up the environment for a worker"""
     env['PROC_TYPE'] = kind
     app_path = join(APP_ROOT, app)
-    log_file = join(LOG_ROOT, app, "{kind}.{ordinal}.log".format(**locals()))
+    log_file = join(LOG_ROOT, app, f"{kind}.{ordinal}.log")
     data_path = join(DATA_ROOT, app)
     venv_path = join(ENV_ROOT, app)
     
@@ -1123,24 +1141,31 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None) -> list:
     if 'VIRTUAL_ENV' not in env:
         env['VIRTUAL_ENV'] = venv_path
     
-    # Construct unit name
-    unit_name = f"{app}_{kind}.{ordinal}"
-    
+    # Create log directory if it doesn't exist
     log_dir = join(LOG_ROOT, app)
     if not exists(log_dir):
         makedirs(log_dir)
+    return app_path, log_file, data_path, venv_path
 
-    if kind == 'web':
-        pass
-    elif kind == 'static':
-        return
-    elif kind.startswith('cron'):
-        # For cron-like jobs, use systemd timer instead of service
-        timer_unit = join(SYSTEMD_ROOT, f"{unit_name}.timer")
-        service_unit = join(SYSTEMD_ROOT, f"{unit_name}.service")
-        
-        # Parse the cron pattern from the command
+
+def setup_cron_worker(app, kind, command, env, ordinal=1):
+    """Set up a cron worker using systemd timer"""
+    app_path, log_file, _, _ = setup_worker_environment(app, kind, env, ordinal)
+    
+    # Construct unit name
+    unit_name = f"{app}_{kind}.{ordinal}"
+    
+    # Create timer and service files
+    timer_unit = join(SYSTEMD_ROOT, f"{unit_name}.timer")
+    service_unit = join(SYSTEMD_ROOT, f"{unit_name}.service")
+    
+    # Parse the cron pattern from the command
+    try:
         cron_parts = command.split(' ', 5)
+        if len(cron_parts) != 6:
+            echo(f"Error: Invalid cron format in command: {command}", fg='red')
+            return []
+            
         minute, hour, day, month, weekday, cmd = cron_parts
 
         # Map numeric weekdays to their names for systemd
@@ -1194,87 +1219,104 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None) -> list:
         with open(service_unit, 'w', encoding='utf-8') as f:
             f.write(service_content)
         
+        echo(f"-----> Created cron timer unit for '{app}:{kind}.{ordinal}'", fg='green')
         return [service_unit, timer_unit]
-    # Check if this is a containerized app (Dockerfile present)
-    containerized = exists(join(app_path, 'Dockerfile'))
+    except Exception as e:
+        echo(f"Error creating cron worker: {str(e)}", fg='red')
+        return []
+
+
+def setup_container_worker(app, kind, command, env, ordinal=1):
+    """Set up a containerized worker using Podman Quadlet"""
+    app_path, log_file, data_path, _ = setup_worker_environment(app, kind, env, ordinal)
     
-    if containerized:
-        # For containerized applications, use Podman Quadlet configuration
-        container_name = f"{app}-{kind}-{ordinal}"
-        image = app
-        host_port = env.get('PORT', '8000')
-        container_port = env.get('CONTAINER_PORT', host_port)
-        app_name = app
+    # Construct unit name and container name
+    unit_name = f"{app}_{kind}.{ordinal}"
+    container_name = f"{app}-{kind}-{ordinal}"
+    
+    # Get ports from environment
+    host_port = env.get('PORT', '8000')
+    container_port = env.get('CONTAINER_PORT', host_port)
+    
+    # Create a .container file in the quadlet directory
+    quadlet_file = join(QUADLET_ROOT, f"{unit_name}.container")
 
-        # Create a .container file in the quadlet directory
-        quadlet_file = join(QUADLET_ROOT, f"{unit_name}.container")
+    # Process additional volume mounts and environment variables
+    extra_volumes = ""
+    extra_environment = ""
+    command_section = ""
 
-        # Process additional volume mounts from environment
-        extra_volumes = ""
-        extra_environment = ""
-        command_section = ""
+    # Add volumes and environment variables from env
+    for key, value in env.items():
+        if key.startswith('VOLUME_'):
+            src, dest = value.split(':')
+            extra_volumes += f"Volume={src}:{dest}\n"
+        elif not key.startswith('VOLUME_') and key != 'PORT' and key != 'CONTAINER_PORT':
+            extra_environment += f'Environment="{key}={value}"\n'
 
-        for key, value in env.items():
-            if key.startswith('VOLUME_'):
-                src, dest = value.split(':')
-                extra_volumes += f"Volume={src}:{dest}\n"
-            elif not key.startswith('VOLUME_') and key != 'PORT' and key != 'CONTAINER_PORT':
-                extra_environment += f'Environment="{key}={value}"\n'
-
-        # Add command if specified
-        if command and command.strip():
-            command_section = f"Exec={command}"
-
-        # Format quadlet content using the template
-        quadlet_content = QUADLET_CONTAINER_TEMPLATE.format(
-            image=image,
-            container_name=container_name,
-            host_port=host_port,
-            container_port=container_port,
-            app_path=app_path,
-            data_path=data_path,
-            extra_volumes=extra_volumes.strip(),
-            extra_environment=extra_environment.strip(),
-            command_section=command_section,
-            log_path=log_file,
-            app_name=app_name
-        )
-
-        # Write the quadlet file
-        with open(quadlet_file, 'w', encoding='utf-8') as f:
-            f.write(quadlet_content)
-
-        # Return the created quadlet file
-        return [quadlet_file]
-    else:
-        # Create regular systemd service file
-        # Explicitly include the full PATH environment variable to ensure commands are found
-        environment_vars = '\n'.join(['Environment="{}={}"'.format(k, v) for k, v in env.items()])
-        # Make sure PATH is explicitly included in environment_vars if not already
-        if 'PATH=' not in environment_vars:
-            environment_vars += '\nEnvironment="PATH={}"'.format(env['PATH'])
-        
-        # Convert command to use absolute path for the executable
+    # Add command if specified
+    if command and command.strip() and command != "podman":
         abs_command = resolve_command_path(command, env['PATH'])
-        
-        unit_content = SYSTEMD_APP_TEMPLATE.format(
-            app_name=app,
-            process_type=kind,
-            instance=ordinal,
-            app_path=app_path,
-            port=env.get('PORT', '8000'),
-            environment_vars=environment_vars,
-            command=abs_command,  # Use the command with absolute path
-            log_path=log_file
-        )
-        
-        # Write service file directly to systemd user directory
-        service_file = join(SYSTEMD_ROOT, f"{unit_name}.service")
-        with open(service_file, 'w', encoding='utf-8') as f:
-            f.write(unit_content)
-        
-        # Return the created service file
-        return [service_file]
+        command_section = f"Exec={abs_command}"
+
+    # Format quadlet content using the template
+    quadlet_content = QUADLET_CONTAINER_TEMPLATE.format(
+        image=app,
+        container_name=container_name,
+        host_port=host_port,
+        container_port=container_port,
+        app_path=app_path,
+        data_path=data_path,
+        extra_volumes=extra_volumes.strip(),
+        extra_environment=extra_environment.strip(),
+        command_section=command_section,
+        log_path=log_file,
+        app_name=app
+    )
+
+    # Write the quadlet file
+    with open(quadlet_file, 'w', encoding='utf-8') as f:
+        f.write(quadlet_content)
+
+    echo(f"-----> Created container quadlet for '{app}:{kind}.{ordinal}'", fg='green')
+    return [quadlet_file]
+
+
+def setup_regular_worker(app, kind, command, env, ordinal=1):
+    """Set up a regular worker using systemd service"""
+    app_path, log_file, _, _ = setup_worker_environment(app, kind, env, ordinal)
+    
+    # Construct unit name
+    unit_name = f"{app}_{kind}.{ordinal}"
+    
+    # Explicitly include the full PATH environment variable to ensure commands are found
+    environment_vars = '\n'.join(['Environment="{}={}"'.format(k, v) for k, v in env.items()])
+    
+    # Make sure PATH is explicitly included in environment_vars if not already
+    if 'PATH=' not in environment_vars:
+        environment_vars += '\nEnvironment="PATH={}"'.format(env['PATH'])
+    
+    # Convert command to use absolute path for the executable
+    abs_command = resolve_command_path(command, env['PATH'])
+    
+    unit_content = SYSTEMD_APP_TEMPLATE.format(
+        app_name=app,
+        process_type=kind,
+        instance=ordinal,
+        app_path=app_path,
+        port=env.get('PORT', '8000'),
+        environment_vars=environment_vars,
+        command=abs_command,  # Use the command with absolute path
+        log_path=log_file
+    )
+    
+    # Write service file directly to systemd user directory
+    service_file = join(SYSTEMD_ROOT, f"{unit_name}.service")
+    with open(service_file, 'w', encoding='utf-8') as f:
+        f.write(unit_content)
+    
+    echo(f"-----> Created service unit for '{app}:{kind}.{ordinal}'", fg='green')
+    return [service_file]
 
 
 def do_stop(app):
