@@ -1008,11 +1008,10 @@ def spawn_app(app, deltas={}):
         for w in v:
             unit_name = f"{app}_{k}.{w}"
             echo(f"-----> Spawning '{app}:{k}.{w}'", fg='green')
-            final_unit = spawn_worker(app, k, workers[k], env, w)
             
-            if final_unit:
+            for unit in spawn_worker(app, k, workers[k], env, w):
                 # Get the basename of the unit file for systemctl commands
-                unit_name = basename(final_unit)
+                unit_name = basename(unit)
                 
                 # Set up environment variables for systemd
                 if 'XDG_RUNTIME_DIR' not in environ:
@@ -1063,7 +1062,49 @@ def spawn_app(app, deltas={}):
     return env
 
 
-def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
+def resolve_command_path(command, env_path):
+    """Find the absolute path for a command using the specified PATH environment
+    
+    If the command includes arguments, it will split them, resolve the executable path,
+    and return the full command with absolute path.
+    """
+    try:
+        # Check if command has arguments
+        if ' ' in command:
+            # Command has arguments - split to get the executable name
+            cmd_parts = command.split(' ', 1)
+            cmd_executable = cmd_parts[0]
+            cmd_args = cmd_parts[1]
+            
+            # Find absolute path for the executable
+            custom_env = environ.copy()
+            custom_env['PATH'] = env_path
+            abs_executable = command_output(f"which {cmd_executable}").strip()
+            
+            if abs_executable:
+                echo(f"-----> Using absolute path for command: {abs_executable}", fg='green')
+                return f"{abs_executable} {cmd_args}"
+            else:
+                echo(f"Warning: Could not find absolute path for '{cmd_executable}'. Using as is.", fg='yellow')
+                return command
+        else:
+            # No arguments, just resolve the executable
+            custom_env = environ.copy()
+            custom_env['PATH'] = env_path
+            abs_executable = command_output(f"which {command}").strip()
+            
+            if abs_executable:
+                echo(f"-----> Using absolute path for command: {abs_executable}", fg='green')
+                return abs_executable
+            else:
+                echo(f"Warning: Could not find absolute path for '{command}'. Using as is.", fg='yellow')
+                return command
+    except Exception as e:
+        echo(f"Warning: Error finding absolute path for '{command}': {e}", fg='yellow')
+        return command
+
+
+def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None) -> list:
     """Set up and deploy a single worker of a given kind using systemd"""
     
     env['PROC_TYPE'] = kind
@@ -1115,10 +1156,10 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
             if day != '*' or month != '*':
                 # Both weekday and specific date - systemd requires both conditions
                 date_str = f"*-{month if month != '*' else '*'}-{day if day != '*' else '*'}"
-                calendar_spec = f"{weekday_str} {date_str} {hour}:{minute.zfill(2)}:00"
+                calendar_spec = f"{weekday_str} {date_str} {hour.zfill(2)}:{minute.zfill(2)}:00"
             else:
                 # Only weekday is specified
-                calendar_spec = f"{weekday_str} *-*-* {hour}:{minute.zfill(2)}:00"
+                calendar_spec = f"{weekday_str} *-*-* {hour.zfill(2)}:{minute.zfill(2)}:00"
         else:
             # No weekday specified, use date format
             date_str = f"*-{month if month != '*' else '*'}-{day if day != '*' else '*'}"
@@ -1131,6 +1172,9 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
             calendar_spec=calendar_spec
         ).replace("[Timer]", "[Timer]\nUnit={}.service".format(unit_name))
 
+        # Convert command to use absolute path for the executable
+        abs_command = resolve_command_path(" ".join(command.split(" ")[5:]), env['PATH'])
+
         # Create a oneshot service that won't restart
         service_content = SYSTEMD_APP_TEMPLATE.format(
             app_name=app,
@@ -1139,7 +1183,7 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
             app_path=app_path,
             port=env.get('PORT', '8000'),
             environment_vars='\n'.join(['Environment="{}={}"'.format(k, v) for k, v in env.items()]),
-            command=cmd,
+            command=abs_command,  # Use the command with absolute path
             log_path=log_file
         ).replace("Restart=always", "Type=oneshot\nRemainAfterExit=no")
 
@@ -1150,8 +1194,7 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
         with open(service_unit, 'w', encoding='utf-8') as f:
             f.write(service_content)
         
-        # Return the timer unit so it will be properly enabled
-        return timer_unit
+        return [service_unit, timer_unit]
     # Check if this is a containerized app (Dockerfile present)
     containerized = exists(join(app_path, 'Dockerfile'))
     
@@ -1202,7 +1245,7 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
             f.write(quadlet_content)
 
         # Return the created quadlet file
-        return quadlet_file
+        return [quadlet_file]
     else:
         # Create regular systemd service file
         # Explicitly include the full PATH environment variable to ensure commands are found
@@ -1212,41 +1255,7 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
             environment_vars += '\nEnvironment="PATH={}"'.format(env['PATH'])
         
         # Convert command to use absolute path for the executable
-        abs_command = command
-        if ' ' in command:
-            # Command has arguments - split to get the executable name
-            cmd_parts = command.split(' ', 1)
-            cmd_executable = cmd_parts[0]
-            cmd_args = cmd_parts[1]
-            
-            # Create a custom environment with the proper PATH for which
-            custom_env = environ.copy()
-            custom_env['PATH'] = env['PATH']
-            
-            # Find the absolute path using the proper PATH (including virtualenv)
-            try:
-                # Use subprocess to find the absolute path with the correct environment
-                abs_executable = command_output(f"which {cmd_executable}").strip()
-                if abs_executable:
-                    echo(f"-----> Using absolute path for command: {abs_executable} {cmd_args}", fg='green')
-                    abs_command = f"{abs_executable} {cmd_args}"
-                else:
-                    echo(f"Warning: Could not find absolute path for '{cmd_executable}'. Using as is.", fg='yellow')
-            except Exception as e:
-                echo(f"Warning: Error finding absolute path for '{cmd_executable}': {e}", fg='yellow')
-        else:
-            # Simple command with no arguments
-            custom_env = environ.copy()
-            custom_env['PATH'] = env['PATH']
-            try:
-                abs_executable = command_output(f"which {command}").strip()
-                if abs_executable:
-                    echo(f"-----> Using absolute path for command: {abs_executable}", fg='green')
-                    abs_command = abs_executable
-                else:
-                    echo(f"Warning: Could not find absolute path for '{command}'. Using as is.", fg='yellow')
-            except Exception as e:
-                echo(f"Warning: Error finding absolute path for '{command}': {e}", fg='yellow')
+        abs_command = resolve_command_path(command, env['PATH'])
         
         unit_content = SYSTEMD_APP_TEMPLATE.format(
             app_name=app,
@@ -1261,11 +1270,11 @@ def spawn_worker(app, kind, command, env, ordinal=1, unit_file=None):
         
         # Write service file directly to systemd user directory
         service_file = join(SYSTEMD_ROOT, f"{unit_name}.service")
-        with open(service_file, 'w') as f:
+        with open(service_file, 'w', encoding='utf-8') as f:
             f.write(unit_content)
         
         # Return the created service file
-        return service_file
+        return [service_file]
 
 
 def do_stop(app):
