@@ -1161,7 +1161,7 @@ def setup_cron_worker(app, kind, command, env, ordinal=1):
     
     # Parse the cron pattern from the command
     try:
-        cron_parts = command.split(' ', 5)
+        cron_parts = command.strip().split(' ', 5)
         if len(cron_parts) != 6:
             echo(f"Error: Invalid cron format in command: {command}", fg='red')
             return []
