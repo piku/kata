@@ -8,11 +8,13 @@ try:
 except AssertionError:
     exit("Kata requires Python 3.12 or above")
 
+from click import argument, Path, echo as click_echo, group, option
+from yaml import safe_load, safe_dump
 from collections import deque
 from fcntl import fcntl, F_SETFL, F_GETFL
 from glob import glob
 from json import loads, dumps, JSONDecodeError
-import http.client
+from http.client import HTTPConnection, HTTPSConnection
 from os import chmod, getgid, getuid, symlink, unlink, pathsep, remove, stat, listdir, environ, makedirs, O_NONBLOCK
 from os.path import abspath, basename, dirname, exists, getmtime, join, realpath, splitext, isdir
 from re import sub, match
@@ -37,24 +39,17 @@ if '.local' not in environ['PATH']:
 # === Globals - all tweakable settings are here ===
 
 KATA_RAW_SOURCE_URL = "https://raw.githubusercontent.com/piku/kata/main/refactor/kata.py"
-KATA_ROOT = environ.get('KATA_ROOT', join(environ['HOME'], '.kata'))
+KATA_ROOT = environ.get('KATA_ROOT', join(environ['HOME']))
 KATA_BIN = join(environ['HOME'], 'bin')
 KATA_SCRIPT = realpath(__file__)
-KATA_PLUGIN_ROOT = abspath(join(KATA_ROOT, "plugins"))
-APP_ROOT = abspath(join(KATA_ROOT, "apps"))
+APP_ROOT = abspath(join(KATA_ROOT, "app"))
 DATA_ROOT = abspath(join(KATA_ROOT, "data"))
-ENV_ROOT = abspath(join(KATA_ROOT, "envs"))
+CONFIG_ROOT = abspath(join(KATA_ROOT, "config"))
 GIT_ROOT = abspath(join(KATA_ROOT, "repos"))
 LOG_ROOT = abspath(join(KATA_ROOT, "logs"))
-CADDY_ROOT = abspath(join(KATA_ROOT, "caddy"))
-CACHE_ROOT = abspath(join(KATA_ROOT, "cache"))
-PODMAN_ROOT = abspath(join(KATA_ROOT, "podman"))
-ACME_ROOT = environ.get('ACME_ROOT', join(environ['HOME'], '.acme.sh'))
-ACME_WWW = abspath(join(KATA_ROOT, "acme"))
-ACME_ROOT_CA = environ.get('ACME_ROOT_CA', 'letsencrypt.org')
-UNIT_PATTERN = "%s@%s.service"
-SYSTEMD_ROOT = join(environ['HOME'], '.config', 'systemd', 'user')
-QUADLET_ROOT = join(SYSTEMD_ROOT, 'containers', 'systemd')
+ENV_ROOT = abspath(join(KATA_ROOT, "envs"))
+
+ROOT_FOLDERS = ['APP_ROOT', 'DATA_ROOT', 'ENV_ROOT', 'CONFIG_ROOT', 'GIT_ROOT', 'LOG_ROOT']
 
 # Set XDG_RUNTIME_DIR if not set (needed for systemd --user)
 if 'XDG_RUNTIME_DIR' not in environ:
@@ -65,278 +60,297 @@ if 'XDG_RUNTIME_DIR' not in environ:
 if KATA_BIN not in environ['PATH']:
     environ['PATH'] = KATA_BIN + ":" + environ['PATH']
 
-# Caddy configuration template
-CADDYFILE_TEMPLATE = """
-{
-  debug
-  admin localhost:2019
-  auto_https off
-  email admin@locahost
+PYTHON_DOCKERFILE = """
+FROM debian:trixie
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt update \
+ && apt dist-upgrade -y \
+ && apt-get -qq install \
+    python3-pip \
+    python3-dev \
+    python3-venv
+
+ENV VIRTUAL_ENV=/venv
+ENV PATH=/venv/bin:$PATH
+VOLUME ["/app", "/config", "/data", "/venv"]
+EXPOSE 8080
+CMD ["python", "-m", "app"]
+"""
+
+RUNTIME_IMAGES = {
+    'python': PYTHON_DOCKERFILE,
 }
 
-"""
-# Systemd unit templates
-
-SYSTEMD_APP_TEMPLATE = """
-[Unit]
-Description=Kata app: {app_name} - {process_type} {instance}
-After=network.target
-
-[Service]
-WorkingDirectory={app_path}
-Environment="PORT={port}"
-{environment_vars}
-ExecStart={command}
-Restart=always
-RestartSec=10
-StandardOutput=append:{log_path}
-StandardError=append:{log_path}
-SyslogIdentifier={app_name}-{process_type}-{instance}
-
-[Install]
-WantedBy=default.target
+COMPOSE_TEMPLATE = """
+services:
+    {service_name}:
+        image: {image}
+        ports:
+        - "{port}:{port}"
+        environment:
+        - PORT={port}
+        volumes:
+        - app:/app
+        - data:/data
+        command: {command}
+volumes:
+    app:
+        driver: local
+        path: {app_path}
+    data:
+        driver: local
+        path: {data_path}
 """
 
-# Podman Quadlet template
-QUADLET_CONTAINER_TEMPLATE = """
-[Container]
-Image={image}
-ContainerName={container_name}
-PublishPort={host_port}:{container_port}
-Volume={app_path}:/app
-Volume={data_path}:/data
-{extra_volumes}
-{extra_environment}
-{command_section}
-
-[Service]
-StandardOutput=append:{log_path}
-StandardError=append:{log_path}
-SyslogIdentifier={app_name}-container
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=default.target
-"""
-
-# Systemd timer template for cron jobs
-SYSTEMD_TIMER_TEMPLATE = """
-[Unit]
-Description=Timer for Kata app: {app_name} - {process_type}
-
-[Timer]
-OnCalendar={calendar_spec}
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-"""
-
-# === Simplified CLI decorators ===
-
-# Registry for commands and arguments
-_commands = {}
-_arguments = {}
-
-def command(name):
-    """Register a function as a CLI command"""
-    def decorator(f):
-        _commands[name] = {
-            "name": name,
-            "func": f,
-            "doc": f.__doc__
-        }
-        return f
-    return decorator
-
-def argument(name, nargs=1):
-    """Add an argument to a command"""
-    def decorator(f):
-        if f.__name__ not in _arguments:
-            _arguments[f.__name__] = []
-
-        _arguments[f.__name__].append({
-            "name": name,
-            "nargs": nargs
-        })
-        return f
-
-    return decorator
-
-def pass_context(f):
-    """Mark a function as requiring context"""
-    f._pass_context = True
-    return f
-
+# Helper functions for click
 def echo(message, fg=None, nl=True, err=False):
     """Print a message with optional color"""
-    color_map = {
-        'green': '\033[92m',
-        'red': '\033[91m',
-        'yellow': '\033[93m',
-        'white': '\033[97m',
-    }
-    reset = '\033[0m'
+    click_echo(message, color=True if fg else None, nl=nl, err=err)
 
-    output_stream = stderr if err else stdout
+# === Utility functions ===
 
-    if fg and fg in color_map:
-        print(f"{color_map[fg]}{message}{reset}", end='\n' if nl else '', file=output_stream, flush=True)
-    else:
-        print(message, end='\n' if nl else '', file=output_stream, flush=True)
+def get_boolean(value):
+    """Convert a boolean-ish string to a boolean."""
+    return value.lower() in ['1', 'on', 'true', 'enabled', 'yes', 'y']
 
-class Context(dict):
-    """Simple context dict for commands that need it"""
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+def base_env(app, env=None):
+    """Get the environment variables for an app"""
 
-    def get_help(self):
-        """Get help information"""
-        return "The other smallest PaaS you've ever seen"
-
-def show_help():
-    """Show help for all commands"""
-    # Get program description
-    echo("Kata: The other smallest PaaS you've ever seen", fg="green")
-
-    echo("\nCommands:", fg="green")
-    for cmd_name in sorted(_commands.keys()):
-        cmd_info = _commands[cmd_name]
-        cmd_help = (cmd_info["doc"] or "").split("\n")[0]
-        if cmd_help:
-            echo(f"  {cmd_name:<15} {cmd_help}", fg="white")
-    echo("")
-
-def run_cli():
-    """Run the CLI with arguments from sys.argv"""
-    args = argv[1:]
-
-    # Show help if no command specified or help requested
-    if not args or args[0] in ('-h', '--help'):
-        show_help()
-        return 0
-
-    cmd_name = args[0]
-    cmd_args = args[1:]
-
-    if cmd_name in _commands:
-        command_func = _commands[cmd_name]["func"]
-
-        # Parse arguments
-        kwargs = {}
-        func_name = command_func.__name__
-        if func_name in _arguments:
-            arg_index = 0
-            for arg_meta in _arguments[func_name]:
-                arg_name = arg_meta["name"]
-                nargs = arg_meta["nargs"]
-
-                if nargs == -1:  # Variable arguments
-                    kwargs[arg_name] = cmd_args[arg_index:]
-                    break
-                elif nargs == 1:  # Single argument
-                    if arg_index < len(cmd_args):
-                        kwargs[arg_name] = cmd_args[arg_index]
-                        arg_index += 1
-                else:  # Multiple arguments
-                    values = []
-                    for _ in range(nargs):
-                        if arg_index < len(cmd_args):
-                            values.append(cmd_args[arg_index])
-                            arg_index += 1
-                    kwargs[arg_name] = values
-
-        # Create context for commands that require it
-        ctx = Context(command=func_name, args=cmd_args)
-
+    base = {}
+    for key in ROOT_FOLDERS:
         try:
-            if hasattr(command_func, '_pass_context'):
-                return command_func(ctx, **kwargs) or 0
-            else:
-                return command_func(**kwargs) or 0
-        except Exception as e:
-            echo(f"Error: {str(e)}", fg="red", err=True)
-            return 1
+            path_value = globals()[key]
+            base[key] = join(path_value, app)
+        except KeyError:
+            echo(f"Error: {key} not found in global variables", fg='red')
+            exit(1)
 
-    echo(f"Error: Command '{cmd_name}' not found", fg="red", err=True)
-    show_help()
-    return 1
+    # If env is provided, update the base environment with it
+    if env is not None:
+        base.update(env)
 
-# === Caddy API Management ===
+    # finally, an ENV or .env file in the app directory overrides things
 
-def reload_caddy_admin():
-    """Reload Caddy config using the admin API (localhost:2019)"""
+    for name in ['ENV', '.env']:
+        env_file = join(APP_ROOT, app, name)
+        if exists(env_file):
+            with open(env_file, 'r', encoding='utf-8') as f:
+                base.update(dict(line.strip().split('=', 1) for line in f if '=' in line))
+    return base
+
+def expandvars(buffer, env, default=None, skip_escaped=False):
+    """expand shell-style environment variables in a buffer"""
+    def replace_var(match):
+        return env.get(match.group(2) or match.group(1), match.group(0) if default is None else default)
+
+    pattern = (r'(?<!\\)' if skip_escaped else '') + r'\$(\w+|\{([^}]*)\})'
+    return sub(pattern, replace_var, buffer)
+
+def load_yaml(filename, env=None):
+    if not exists(filename):
+        echo(f"File not found: {filename}", fg='red')
+        return None
+    if env is None:
+        env = environ.copy()
+    with open(filename, 'r', encoding='utf-8') as f:
+        content = f.read()
+    content = expandvars(content, env)
     try:
-        conn = http.client.HTTPConnection('localhost', 2019, timeout=3)
-        conn.request('POST', '/load', headers={'Content-Type': 'application/json'})
-        resp = conn.getresponse()
-        if resp.status == 200:
-            echo("-----> Reloaded Caddy configuration via admin API", fg='green')
-        else:
-            body = resp.read().decode(errors='replace')
-            echo(f"Warning: Caddy admin API reload failed: {resp.status} {resp.reason}\n{body}", fg='yellow')
-        conn.close()
+        return safe_load(content)
     except Exception as e:
-        echo(f"Warning: Could not reload Caddy via admin API: {e}", fg='yellow')
+        echo(f"Error parsing YAML: {str(e)}", fg='red')
+        return None
 
+def get_free_port(address=""):
+    """Find a free TCP port (entirely at random)"""
+    s = socket(AF_INET, SOCK_STREAM)
+    s.bind((address, 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
 
-def load_caddy_json(app_path):
-    """Load the caddy.json file from the app directory if it exists"""
-    caddy_json = join(app_path, 'caddy.json')
-    if exists(caddy_json):
-        try:
-            with open(caddy_json, 'r', encoding='utf-8') as f:
-                echo("-----> Found caddy.json configuration", fg='green')
-                json_content = f.read()
-                try:
-                    return loads(json_content)
-                except Exception as json_error:
-                    echo(f"Error parsing caddy.json: {json_error}", fg='red')
-                    # Try to identify the location of the error
-                    try:
-                        loads(json_content)
-                    except JSONDecodeError as detailed_error:
-                        echo(f"JSON syntax error at line {detailed_error.lineno}, column {detailed_error.colno}: {detailed_error.msg}", fg='yellow')
-                    echo("Make sure your caddy.json contains valid JSON", fg='yellow')
-                    return None
-        except Exception as e:
-            echo(f"Error loading caddy.json for app: {e}", fg='red')
-            echo("Make sure your caddy.json file exists and is readable", fg='yellow')
-    return None
+# === SSH and git Helpers ===
 
-def expand_env_in_json(json_obj, env):
-    """Recursively substitute environment variables in JSON values"""
-    if isinstance(json_obj, dict):
-        return {k: expand_env_in_json(v, env) for k, v in json_obj.items()}
-    elif isinstance(json_obj, list):
-        return [expand_env_in_json(item, env) for item in json_obj]
-    elif isinstance(json_obj, str):
-        return expandvars(json_obj, env)
-    else:
-        return json_obj
+def setup_authorized_keys(ssh_fingerprint, script_path, pubkey):
+    """Sets up an authorized_keys file to redirect SSH commands"""
+    authorized_keys = join(environ['HOME'], '.ssh', 'authorized_keys')
+    if not exists(dirname(authorized_keys)):
+        makedirs(dirname(authorized_keys))
+    # Restrict features and force all SSH commands to go through our script
+    with open(authorized_keys, 'a', encoding='utf-8') as h:
+        h.write(f"""command="FINGERPRINT={ssh_fingerprint:s} NAME=default {script_path:s} $SSH_ORIGINAL_COMMAND",no-agent-forwarding,no-user-rc,no-X11-forwarding,no-port-forwarding {pubkey:s}\n""")
+    chmod(dirname(authorized_keys), S_IRUSR | S_IWUSR | S_IXUSR)
+    chmod(authorized_keys, S_IRUSR | S_IWUSR)
 
-def get_worker_types(app):
-    """Return list of worker types for an app"""
+def command_output(cmd):
+    """executes a command and grabs its output, if any"""
+    try:
+        env = environ
+        return check_output(cmd, env=env, shell=True, universal_newlines=True)
+    except Exception as e:
+        return str(e)
+
+# === Docker Helpers ===
+
+def docker_check_image_exists(image_name):
+    """Check if a Docker image exists locally"""
+    try:
+        output = check_output(['docker', 'image', 'inspect', image_name], stderr=STDOUT, universal_newlines=True)
+        return True
+    except Exception as e:
+        if "No such image" in str(e):
+            return False
+        else:
+            echo(f"Error checking image: {str(e)}", fg='red')
+            return False
+
+def docker_create_runtime_image(image_name, dockerfile_content):
+    """Create a Docker image from a Dockerfile content"""
+    try:
+        with NamedTemporaryFile(delete=False, mode='w', suffix='.Dockerfile') as dockerfile:
+            dockerfile.write(dockerfile_content)
+            dockerfile_path = dockerfile.name
+
+        # Build the Docker image
+        output = check_output(['docker', 'build', '-t', image_name, '-f', dockerfile_path, '.'], stderr=STDOUT, universal_newlines=True)
+        echo(f"Created Docker image '{image_name}' successfully.", fg='green')
+        return True
+    except Exception as e:
+        echo(f"Error creating Docker image: {str(e)}", fg='red')
+        return False
+    finally:
+        remove(dockerfile_path)
+
+# === App Management ===
+
+def exit_if_invalid(app, deployed=False):
+    """Make sure the app exists"""
     app = sanitize_app_name(app)
     app_path = join(APP_ROOT, app)
-    procfile = join(app_path, 'Procfile')
+    if not exists(app_path):
+        echo(f"Error: app '{app}' not deployed!", fg='red')
+        exit(1)
+    return app
 
-    # First check if we parsed workers from procfile
-    if exists(procfile):
-        workers = parse_procfile(procfile)
-        if workers:
-            return list(workers.keys())
+def parse_settings(filename, env={}):
+    """Parses a settings file and returns a dict with environment variables"""
+    if not exists(filename):
+        return {}
 
-    # Check for special case workers from container/compose deployments
-    workers = []
-    if exists(join(app_path, 'Dockerfile')):
-        workers.append('container')
-    if exists(join(app_path, 'docker-compose.yaml')):
-        workers.append('compose')
-    if exists(join(app_path, 'caddy.json')) and not workers:
-        workers.append('static')
-    return workers
+    with open(filename, 'r') as settings:
+        for line in settings:
+            if line[0] == '#' or len(line.strip()) == 0:  # ignore comments and newlines
+                continue
+            try:
+                k, v = map(lambda x: x.strip(), line.split("=", 1))
+                env[k] = expandvars(v, env)
+            except Exception as e:
+                echo(f"Error: malformed setting '{line}', ignoring file: {e}", fg='red')
+                return {}
+    return env
+
+def sanitize_app_name(app):
+    """Sanitize the app name"""
+    if app:
+        return sub(r'[^a-zA-Z0-9_-]', '', app)
+    return app
+
+
+def parse_yaml(app_name, filename) -> tuple:
+    """Parses the kata-compose.yaml file and returns a tuple of
+        (list[workers], docker-compose dict, caddy config dict)"""
+
+    data = load_yaml(filename, base_env(app_name))
+
+    if not data:
+        return None
+
+    env = {}
+    if "environment" in data:
+        env = data["environment"]
+
+    env = base_env(app_name, env)
+    echo(f"Using environment for {app_name}: {env}", fg='green')
+
+    if not "services" in data:
+        echo(f"Warning: no 'services' section found in {filename}", fg='yellow')
+    services = data.get("services", {})
+
+    for service_name, service in services.items():
+        if not "image" in service:
+            echo(f"Warning: service '{service_name}' in {filename} has no 'image' specified", fg='yellow')
+            if "runtime" in service:
+                service["image"] = join("kata", service["runtime"])
+                if not docker_check_image_exists(join("kata", service["runtime"])):
+                    if service["runtime"] in RUNTIME_IMAGES:
+                        if docker_create_runtime_image(join("kata", service["runtime"]), RUNTIME_IMAGES[service["runtime"]]):
+                            service["image"] = join("kata",service["runtime"])
+                    else:
+                        echo(f"Error: runtime '{service['runtime']}' not supported", fg='red')
+                        exit(1)
+                del service["runtime"]
+        if not "command" in service:
+            echo(f"Warning: service '{service_name}' in {filename} has no 'command' specified", fg='yellow')
+            continue
+        if not "ports" in service:
+            echo(f"Warning: service '{service_name}' in {filename} has no 'ports' specified", fg='yellow')
+            continue
+
+        if not "environment" in service:
+            service["environment"] = {}
+        service["environment"].update(env)
+
+    # prepend app name to service names, links and depends_on
+    old = []
+    new_services = {}
+    for service_name in services.keys():
+        if not service_name.startswith(app_name + '-'):
+            old.append(service_name)
+            new_name = app_name + '-' + service_name
+            new_services[new_name] = services[service_name].copy()
+            if "links" in new_services[new_name]:
+                # prepend app name to links
+                for i, link in enumerate(new_services[new_name]["links"]):
+                    if not link.startswith(app_name + '-'):
+                        new_services[new_name]["links"][i] = app_name + '-' + link
+
+            if "depends_on" in new_services[new_name]:
+                for i, depends_on in enumerate(new_services[new_name]["depends_on"]):
+                    if not depends_on.startswith(app_name + '-'):
+                        new_services[new_name]["depends_on"][i] = app_name + '-' + depends_on
+    data["services"] = new_services
+
+    caddy_config = {}
+    if "caddy" in data.keys():
+        caddy_config = data.get("caddy", {})
+        del data["caddy"]
+    else:
+        echo(f"Warning: no 'caddy' section found in {filename}", fg='yellow')
+
+    if not "volumes" in data.keys():
+        volumes = {
+            "app": join(APP_ROOT, app_name),
+            "config": join(ENV_ROOT, app_name),
+            "data": join(DATA_ROOT, app_name),
+            "venv": join(ENV_ROOT, app_name)
+        }
+        echo(f"Warning: no 'volumes' section found in {filename}, creating default", fg='yellow')
+        for volume in ["app", "config", "data", "venv"]:
+            echo(f"Warning: no '{volume}' volume found in {filename}, creating default", fg='yellow')
+            makedirs(volumes[volume], exist_ok=True)
+            data["volumes"] = data.get("volumes", {})
+            data["volumes"][volume] = {
+                "driver": "local",
+                "driver_opts": {
+                    "o": "bind",
+                    "type": "none",
+                    "device": volumes[volume]
+                }
+            }
+    return (data, caddy_config)
+
+
+# Caddy API Management
 
 def validate_caddy_json(config):
     if not isinstance(config, dict):
@@ -360,43 +374,23 @@ def validate_caddy_json(config):
                 return False, "Each handler must have a 'handler' field"
     return True, None
 
-def configure_caddy_for_app(app, env):
+def caddy_config(app, config_json):
     """Configure Caddy for an app using the admin API"""
-    app = sanitize_app_name(app)
-    app_path = join(APP_ROOT, app)
-
-    config_json = load_caddy_json(app_path)
-
-    if not config_json:
-        echo(f"No caddy.json found for app '{app}', skipping Caddy configuration", fg='yellow')
-        echo("Add a caddy.json file to configure web routing for this app", fg='yellow')
-        return False
 
     is_valid, error_message = validate_caddy_json(config_json)
     if not is_valid:
-        echo(f"Error in caddy.json: {error_message}", fg='red')
-        echo("Please check your caddy.json file for errors", fg='yellow')
-        return False
-
-    # TODO: make sure we are handling PORT as an internal affair
-    if 'PORT' not in env and not any(worker in ['container', 'compose'] for worker in get_worker_types(app)):
-        echo("Error: PORT environment variable must be set for Caddy configuration", fg='red')
+        echo(f"Error in caddy configuration: {error_message}", fg='red')
         return False
     try:
-        config_json = expand_env_in_json(config_json, env)
         config_data = dumps(config_json).encode('utf-8')
         echo(f"-----> Configuring Caddy for app '{app}'", fg='green')
-
-        # Output what we're sending
-        echo(str(config_data), fg="yellow")
-
         # First, get the current complete Caddy configuration
         try:
-            get_conn = http.client.HTTPConnection('localhost', 2019, timeout=5)
-            get_conn.request('GET', '/config/')
-            get_resp = get_conn.getresponse()
+            c = HTTPConnection('localhost', 2019, timeout=1)
+            c.request('GET', '/config/')
+            get_resp = c.getresponse()
             current_config = loads(get_resp.read().decode('utf-8'))
-            get_conn.close()
+            c.close()
 
             # Ensure the structure exists
             if 'apps' not in current_config:
@@ -413,10 +407,9 @@ def configure_caddy_for_app(app, env):
             config_data = dumps(current_config).encode('utf-8')
 
             # Update the full config
-            conn = http.client.HTTPConnection('localhost', 2019, timeout=5)
-            conn.request('POST', '/load', body=config_data,
-                        headers={'Content-Type': 'application/json'})
-            resp = conn.getresponse()
+            c = HTTPConnection('localhost', 2019, timeout=1)
+            c.request('POST', '/load', body=config_data, headers={'Content-Type': 'application/json'})
+            resp = c.getresponse()
             body = resp.read().decode('utf-8', errors='replace')
         except Exception as e:
             echo(f"Error preparing Caddy configuration: {e}", fg='red')
@@ -437,18 +430,17 @@ def configure_caddy_for_app(app, env):
     finally:
         pass
 
-def get_caddy_config(app=None):
+def caddy_get(app=None):
     """Get Caddy configuration using the admin API"""
     try:
-        conn = http.client.HTTPConnection('localhost', 2019, timeout=5)
+        c = HTTPConnection('localhost', 2019, timeout=1)
         api_path = "/config/"
-        conn.request('GET', api_path)
-        resp = conn.getresponse()
+        c.request('GET', api_path)
+        resp = c.getresponse()
         body = resp.read().decode('utf-8', errors='replace')
         if resp.status == 200:
             config = loads(body)
             if app:
-                app = sanitize_app_name(app)
                 if 'apps' in config and 'http' in config['apps']:
                     if 'servers' in config['apps']['http'] and app in config['apps']['http']['servers']:
                         return config['apps']['http']['servers'][app]
@@ -465,19 +457,17 @@ def get_caddy_config(app=None):
         echo(f"Error getting Caddy configuration: {e}", fg='red')
         return None
 
-def remove_caddy_config_for_app(app):
+def caddy_remove(app):
     """Remove Caddy configuration for an app using the admin API"""
-    app = sanitize_app_name(app)
-
     try:
         echo(f"-----> Removing Caddy configuration for app '{app}'", fg='yellow')
 
         # First, get the current complete Caddy configuration
-        conn = http.client.HTTPConnection('localhost', 2019, timeout=5)
-        conn.request('GET', '/config/')
-        resp = conn.getresponse()
+        c = HTTPConnection('localhost', 2019, timeout=1)
+        c.request('GET', '/config/')
+        resp = c.getresponse()
         current_config = loads(resp.read().decode('utf-8'))
-        conn.close()
+        c.close()
 
         # Check if the app exists in the configuration
         if ('apps' in current_config and 'http' in current_config['apps'] and
@@ -487,10 +477,10 @@ def remove_caddy_config_for_app(app):
             del current_config['apps']['http']['servers'][app]
 
             config_data = dumps(current_config).encode('utf-8')
-            conn = http.client.HTTPConnection('localhost', 2019, timeout=5)
-            conn.request('POST', '/load', body=config_data,
-                         headers={'Content-Type': 'application/json'})
-            resp = conn.getresponse()
+            c = HTTPConnection('localhost', 2019, timeout=5)
+            c.request('POST', '/load', body=config_data,
+                      headers={'Content-Type': 'application/json'})
+            resp = c.getresponse()
             resp.read()  # Consume the response body
 
             if resp.status in (200, 204):
@@ -508,159 +498,13 @@ def remove_caddy_config_for_app(app):
     finally:
         pass
 
-# === Utility functions ===
-
-def sanitize_app_name(app):
-    """Sanitize the app name and build matching path"""
-    app = "".join(c for c in app if c.isalnum() or c in ('.', '_', '-')).rstrip().lstrip('/')
-    return app
-
-
-def exit_if_invalid(app):
-    """Utility function for error checking upon command startup."""
-    app = sanitize_app_name(app)
-    if not exists(join(APP_ROOT, app)):
-        echo("Error: app '{}' not found.".format(app), fg='red')
-        exit(1)
-    return app
-
-
-def get_free_port(address=""):
-    """Find a free TCP port (entirely at random)"""
-    s = socket(AF_INET, SOCK_STREAM)
-    s.bind((address, 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
-def get_boolean(value):
-    """Convert a boolean-ish string to a boolean."""
-    return value.lower() in ['1', 'on', 'true', 'enabled', 'yes', 'y']
-
-
-def write_config(filename, bag, separator='='):
-    """Helper for writing out config files"""
-    with open(filename, 'w', encoding='utf-8') as h:
-        for k, v in bag.items():
-            h.write(f"{k:s}{separator:s}{v}\n")
-
-
-def setup_authorized_keys(ssh_fingerprint, script_path, pubkey):
-    """Sets up an authorized_keys file to redirect SSH commands"""
-    authorized_keys = join(environ['HOME'], '.ssh', 'authorized_keys')
-    if not exists(dirname(authorized_keys)):
-        makedirs(dirname(authorized_keys))
-    # Restrict features and force all SSH commands to go through our script
-    with open(authorized_keys, 'a', encoding='utf-8') as h:
-        h.write(f"""command="FINGERPRINT={ssh_fingerprint:s} NAME=default {script_path:s} $SSH_ORIGINAL_COMMAND",no-agent-forwarding,no-user-rc,no-X11-forwarding,no-port-forwarding {pubkey:s}\n""")
-    chmod(dirname(authorized_keys), S_IRUSR | S_IWUSR | S_IXUSR)
-    chmod(authorized_keys, S_IRUSR | S_IWUSR)
-
-
-def parse_procfile(filename):
-    """Parses a Procfile and returns the worker types. Only one worker of each type is allowed."""
-    workers = {}
-    if not exists(filename):
-        return {}
-
-    with open(filename, 'r', encoding='utf-8') as procfile:
-        for line_number, line in enumerate(procfile):
-            line = line.strip()
-            if line.startswith("#") or not line:
-                continue
-            try:
-                if ":" not in line:
-                    echo(f"Warning: missing colon separator in Procfile at line {line_number + 1}: '{line}'", fg='yellow')
-                    continue
-                
-                kind, cmd = map(lambda x: x.strip(), line.split(":", 1))
-                # Warn about deprecated worker types
-                if kind == 'wsgi':
-                    echo("Warning: 'wsgi' worker type is deprecated. Please use 'web' instead.", fg='yellow')
-                    kind = 'web'
-                # Check for cron patterns
-                if kind.startswith("cron"):
-                    limits = [59, 24, 31, 12, 7]
-                    res = match(r"^((?:(?:\*\/)?\d+)|\*) ((?:(?:\*\/)?\d+)|\*) ((?:(?:\*\/)?\d+)|\*) ((?:(?:\*\/)?\d+)|\*) ((?:(?:\*\/)?\d+)|\*) (.*)$", cmd)
-                    if res:
-                        matches = res.groups()
-                        for i in range(len(limits)):
-                            if int(matches[i].replace("*/", "").replace("*", "1")) > limits[i]:
-                                raise ValueError
-                workers[kind] = cmd
-            except Exception as e:
-                echo(f"Warning: misformatted Procfile entry '{line}' at line {line_number + 1}: {e}", fg='yellow')
-    if len(workers) == 0:
-        return {}
-    return workers
-
-
-def expandvars(buffer, env, default=None, skip_escaped=False):
-    """expand shell-style environment variables in a buffer"""
-    def replace_var(match):
-        return env.get(match.group(2) or match.group(1), match.group(0) if default is None else default)
-
-    pattern = (r'(?<!\\)' if skip_escaped else '') + r'\$(\w+|\{([^}]*)\})'
-    return sub(pattern, replace_var, buffer)
-
-
-def command_output(cmd):
-    """executes a command and grabs its output, if any"""
-    try:
-        env = environ
-        result = check_output(cmd, stderr=STDOUT, env=env, shell=True)
-        # Properly decode bytes to string
-        return result.decode('utf-8', errors='replace')
-    except Exception:
-        return ""
-
-
-def parse_settings(filename, env={}):
-    """Parses a settings file and returns a dict with environment variables"""
-    if not exists(filename):
-        return {}
-
-    with open(filename, 'r') as settings:
-        for line in settings:
-            if line[0] == '#' or len(line.strip()) == 0:  # ignore comments and newlines
-                continue
-            try:
-                k, v = map(lambda x: x.strip(), line.split("=", 1))
-                env[k] = expandvars(v, env)
-            except Exception as e:
-                echo(f"Error: malformed setting '{line}', ignoring file: {e}", fg='red')
-                return {}
-    return env
-
-
-def check_requirements(binaries):
-    """Checks if all the binaries exist and are executable"""
-    echo(f"-----> Checking requirements: {binaries}", fg='green')
-    requirements = list(map(which, binaries))
-    echo(str(requirements))
-
-    if None in requirements:
-        return False
-    return True
-
-# === Application Mangement ===
-
-def found_app(kind):
-    """Helper function to output app detected"""
-    echo(f"-----> {kind} app detected.", fg='green')
-    return True
-
+# Basic deployment functions
 
 def do_deploy(app, deltas={}, newrev=None):
     """Deploy an app by resetting the work directory"""
 
     app_path = join(APP_ROOT, app)
-    procfile = join(app_path, 'Procfile')
-    caddy_json = join(app_path, 'caddy.json')
-    dockerfile_path = join(app_path, 'Dockerfile')
-    compose_path = join(app_path, 'docker-compose.yaml')
-    log_path = join(LOG_ROOT, app)
+    compose_file = join(app_path, 'kata-compose.yaml')
 
     env = {'GIT_WORK_DIR': app_path}
     if exists(app_path):
@@ -670,808 +514,54 @@ def do_deploy(app, deltas={}, newrev=None):
             call(f'git reset --hard {newrev}', cwd=app_path, env=env, shell=True)
         call('git submodule init', cwd=app_path, env=env, shell=True)
         call('git submodule update', cwd=app_path, env=env, shell=True)
-        if not exists(log_path):
-            makedirs(log_path)
-
-        workers = parse_procfile(procfile)
-        caddy_json = join(app_path, 'caddy.json')
-
-        # Add a virtual 'static' worker if we have caddy.json but no workers from Procfile
-        if (not workers or len(workers) == 0) and exists(caddy_json):
-            workers = {"static": "echo 'Static site via Caddy'"}
-
-        if workers and len(workers) > 0:
-            settings = {}
-
-            # Check for wsgi worker and show a warning
-            if "wsgi" in workers:
-                echo("Warning: 'wsgi' worker type is deprecated. Please use 'web' instead.", fg='yellow')
-                # Ignore wsgi worker
-                workers.pop("wsgi", None)
-
-            if "preflight" in workers:
-                echo("-----> Running preflight.", fg='green')
-                retval = call(workers["preflight"], cwd=app_path, env=settings, shell=True)
-                if retval:
-                    echo(f"-----> Exiting due to preflight command error value: {retval}")
-                    exit(retval)
-                workers.pop("preflight", None)
-
-            # Detect application type and deploy
-            static_check_keys = set(workers.keys()) - {"preflight", "release"}
-            deployed = False
-            if exists(join(app_path, 'requirements.txt')) and found_app("Python"):
-                settings.update(deploy_python(app, deltas))
-                deployed = True
-            elif exists(join(app_path, 'pyproject.toml')) and (exists(join(app_path, 'uv.lock')) or exists(join(app_path, '.uv'))) and which('uv') and found_app("Python (uv)"):
-                settings.update(deploy_python_with_uv(app, deltas))
-                deployed = True
-            elif exists(dockerfile_path) and found_app("Containerized") and check_requirements(['podman']):
-                settings.update(deploy_containerized(app, deltas))
-                deployed = True
-            elif exists(compose_path) and found_app("Docker Compose") and check_requirements(['podman-compose']):
-                settings.update(deploy_compose(app, deltas))
-                deployed = True
-            elif (
-                # Only static worker(s) present (allow preflight/release)
-                len(static_check_keys) > 0 and all(k == "static" for k in static_check_keys)
-                and found_app("Static")
-            ):
-                # Only static worker(s) present
-                settings.update(setup_app(app, deltas))
-                deployed = True
-            # If static worker is present, always (re)generate Caddy config for static assets
-            if 'static' in workers and not deployed:
-                settings.update(setup_app(app, deltas))
-                deployed = True
-            if not deployed:
-                if exists(caddy_json):
-                    echo("-----> Detected static site with caddy.json", fg='green')
-                    settings.update(setup_app(app, deltas))
-                    deployed = True
-                # Check for containerized apps
-                elif exists(dockerfile_path) and found_app("Containerized") and check_requirements(['podman']):
-                    if exists(caddy_json):
-                        echo("-----> Deploying containerized app with web interface via caddy.json", fg='green')
-                    else:
-                        echo("-----> Deploying containerized app without web interface", fg='green')
-                    settings.update(deploy_containerized(app, deltas))
-                    deployed = True
-                elif exists(compose_path) and found_app("Docker Compose") and check_requirements(['podman-compose']):
-                    if exists(caddy_json):
-                        echo("-----> Deploying compose app with web interface via caddy.json", fg='green')
-                    else:
-                        echo("-----> Deploying compose app without web interface", fg='green')
-                    settings.update(deploy_compose(app, deltas))
-                    deployed = True
-                else:
-                    echo("-----> Could not detect runtime!", fg='red')
-                    echo("-----> Only Python, containerized apps, and static sites with caddy.json are currently supported.", fg='yellow')
-
-            if "release" in workers:
-                echo("-----> Releasing", fg='green')
-                retval = call(workers["release"], cwd=app_path, env=settings, shell=True)
-                if retval:
-                    echo("-----> Exiting due to release command error value: {}".format(retval))
-                    exit(retval)
-                workers.pop("release", None)
-        else:
-            # Check for container files or caddy.json even without a valid Procfile
-            if exists(dockerfile_path) and found_app("Containerized") and check_requirements(['podman']):
-                echo("-----> No Procfile found, but Dockerfile exists. Deploying containerized app.", fg='yellow')
-                # Create a non-web worker for the container
-                workers = {"container": "podman"}
-                settings = deploy_containerized(app, deltas)
-                # If we also have caddy.json, mention it will be used for web routing
-                if exists(caddy_json):
-                    echo("-----> Found caddy.json, will configure web routing for containerized app", fg='green')
-            elif exists(compose_path) and found_app("Docker Compose") and check_requirements(['podman-compose']):
-                echo("-----> No Procfile found, but docker-compose.yaml exists. Deploying with podman-compose.", fg='yellow')
-                # Create a non-web worker for the compose setup
-                workers = {"compose": "podman-compose"}
-                settings = deploy_compose(app, deltas)
-                # If we also have caddy.json, mention it will be used for web routing
-                if exists(caddy_json):
-                    echo("-----> Found caddy.json, will configure web routing for compose app", fg='green')
-            # Check if there's a caddy.json file even though Procfile is invalid/empty
-            elif exists(caddy_json):
-                echo("-----> No valid Procfile found, but caddy.json exists. Deploying as static site.", fg='yellow')
-                settings = setup_app(app, deltas)
-            else:
-                echo(f"Error: No valid Procfile, Dockerfile, docker-compose.yaml or caddy.json found for app '{app}'.", fg='red')
+        compose, caddy = parse_yaml(app, compose_file)
+        with open(join(APP_ROOT, app, "docker-compose.yaml"), "w", encoding='utf-8') as f:
+            f.write(safe_dump(compose))
+        caddy_config(app, caddy)
+        do_start(app)
     else:
         echo(f"Error: app '{app}' not found.", fg='red')
 
-
-def deploy_python(app, deltas={}):
-    """Deploy a Python application"""
-
-    venv_path = join(ENV_ROOT, app)
-    requirements = join(APP_ROOT, app, 'requirements.txt')
-    env_file = join(APP_ROOT, app, 'ENV')
-    # Set unbuffered output and readable UTF-8 mapping
-    env = {
-        'PYTHONUNBUFFERED': '1',
-        'PYTHONIOENCODING': 'UTF_8:replace'
-    }
-    if exists(env_file):
-        env.update(parse_settings(env_file, env))
-
-    first_time = False
-    if not exists(join(venv_path, "bin", "activate")):
-        echo(f"-----> Creating venv for '{app}'", fg='green')
-        try:
-            makedirs(venv_path)
-        except FileExistsError:
-            echo(f"-----> Env dir already exists: '{app}'", fg='yellow')
-        # Use python3 explicitly instead of python
-        call(f'python3 -m venv {app:s}', cwd=ENV_ROOT, shell=True)
-        first_time = True
-
-    # Use environment variable approach instead of activate_this.py
-    venv_bin = join(venv_path, 'bin')
-    environ['PATH'] = venv_bin + pathsep + environ['PATH']
-    environ['VIRTUAL_ENV'] = venv_path
-    # Remove PYTHONHOME if it exists as it can interfere with the virtual environment
-    if 'PYTHONHOME' in environ:
-        del environ['PYTHONHOME']
-    
-    # Use the pip from the virtual environment
-    pip_path = join(venv_bin, 'pip')
-
-    if first_time or getmtime(requirements) > getmtime(venv_path):
-        echo(f"-----> Running pip for '{app}'", fg='green')
-        call(f'{pip_path} install -r {requirements}', cwd=venv_path, shell=True)
-    return setup_app(app, deltas)
-
-
-def deploy_python_with_uv(app, deltas={}):
-    """Deploy a Python application using Astral uv"""
-
-    echo(f"=====> Starting uv deployment for '{app}'", fg='green')
-    env_file = join(APP_ROOT, app, 'ENV')
-    venv_path = join(ENV_ROOT, app)
-    # Set unbuffered output and readable UTF-8 mapping
-    env = {
-        **environ,
-        'PYTHONUNBUFFERED': '1',
-        'PYTHONIOENCODING': 'UTF_8:replace',
-        'UV_PROJECT_ENVIRONMENT': venv_path
-    }
-    if exists(env_file):
-        env.update(parse_settings(env_file, env))
-
-    echo("-----> Calling uv sync", fg='green')
-    call('uv sync --python-preference only-system', cwd=join(APP_ROOT, app), env=env, shell=True)
-
-    return setup_app(app, deltas)
-
-
-def deploy_containerized(app, deltas={}):
-    """Deploy a containerized application using Podman Quadlets"""
-
+def do_start(app):
     app_path = join(APP_ROOT, app)
-    env_file = join(APP_ROOT, app, 'ENV')
-    env = {}
-
-    if exists(env_file):
-        env.update(parse_settings(env_file, env))
-
-    echo(f"-----> Building container for '{app}'", fg='green')
-    call(f'podman build -t {app} .', cwd=app_path, shell=True)
-
-    # Ensure quadlet directory exists
-    podman_dir = join(PODMAN_ROOT, app)
-    if not exists(podman_dir):
-        makedirs(podman_dir)
-
-    echo(f"-----> Setting up Podman Quadlet configuration for '{app}'", fg='green')
-
-    return setup_app(app, deltas)
-
-
-def deploy_compose(app, deltas={}):
-    """Deploy an application using podman-compose"""
-
-    app_path = join(APP_ROOT, app)
-    env_file = join(APP_ROOT, app, 'ENV')
-    env = {}
-
-    if exists(env_file):
-        env.update(parse_settings(env_file, env))
-
-    echo(f"-----> Setting up podman-compose for '{app}'", fg='green')
-    return setup_app(app, deltas)
-
-
-def setup_app(app, deltas={}):
-    """Create all workers for an app using systemd units and Caddy"""
-
-    app_path = join(APP_ROOT, app)
-    procfile = join(app_path, 'Procfile')
-    caddy_json = join(app_path, 'caddy.json')
-    dockerfile_path = join(app_path, 'Dockerfile')
-    compose_path = join(app_path, 'docker-compose.yaml')
-
-    workers = parse_procfile(procfile)
-    workers.pop("preflight", None)
-    workers.pop("release", None)
-    worker_count = {k: 1 for k in workers.keys()}
-
-    # Handle special cases where we don't have a Procfile or it's empty
-    if len(workers) == 0:
-        if exists(dockerfile_path):
-            echo("-----> No Procfile found, but Dockerfile exists. Using containerized deployment.", fg='yellow')
-            workers["container"] = "podman"  # Use a non-web worker type
-            worker_count["container"] = 1
-            # If we also have caddy.json, mention it will be used for web routing
-            if exists(caddy_json):
-                echo("-----> Found caddy.json, will configure web routing for containerized app", fg='green')
-                # Default port will be set in setup_app
-        # For compose apps without Procfile, add a system worker (not web)
-        elif exists(compose_path):
-            echo("-----> No Procfile found, but docker-compose.yaml exists. Using compose deployment.", fg='yellow')
-            workers["compose"] = "podman-compose"  # Use a non-web worker type
-            worker_count["compose"] = 1
-            # If we also have caddy.json, mention it will be used for web routing
-            if exists(caddy_json):
-                echo("-----> Found caddy.json, will configure web routing for compose app", fg='green')
-                # Default port will be set in setup_app
-        # Add a virtual 'static' worker if we have only caddy.json but no container/compose files
-        elif exists(caddy_json):
-            echo("-----> No Procfile found, but caddy.json exists. Treating as static site.", fg='yellow')
-            workers["static"] = "echo 'Static site via Caddy'"
-            worker_count["static"] = 1
-
-    venv_path = join(ENV_ROOT, app)
-    env_file = join(APP_ROOT, app, 'ENV')
-    settings = join(ENV_ROOT, app, 'ENV')
-    live = join(ENV_ROOT, app, 'LIVE_ENV')
-    scaling = join(ENV_ROOT, app, 'SCALING')
-
-    # Bootstrap environment
-    env = {
-        'APP': app,
-        'APP_ROOT': join(APP_ROOT, app),
-        'LOG_ROOT': join(LOG_ROOT, app),
-        'DATA_ROOT': join(DATA_ROOT, app),
-        'CACHE_ROOT': join(CACHE_ROOT, app),
-        'HOME': environ['HOME'],
-        'USER': environ['USER'],
-        'PATH': ':'.join([join(venv_path, 'bin'), environ['PATH']]),
-        'PWD': dirname(env_file),
-        'VIRTUAL_ENV': venv_path,
-    }
-
-    safe_defaults = {
-        'BIND_ADDRESS': '127.0.0.1',
-    }
-
-    # Load environment variables shipped with repo (if any)
-    if exists(env_file):
-        env.update(parse_settings(env_file, env))
-
-    # Override with custom settings (if any)
-    if exists(settings):
-        env.update(parse_settings(settings, env))
-
-    # For containerized apps with caddy.json, set a default port if none exists
-    if ('container' in workers.keys() or 'compose' in workers.keys()) and exists(caddy_json) and 'PORT' not in env:
-        echo("-----> No PORT specified in ENV, using default port 8080 for Caddy configuration", fg='yellow')
-        env['PORT'] = '8080'
-
-    # Check whether we need to configure Caddy
-    needs_caddy = 'web' in workers or 'static' in workers or exists(caddy_json)
-
-    if needs_caddy:
-        echo("-----> Configuring web application", fg='green')
-
-        if 'PORT' not in env and not any(worker_type in ['container', 'compose'] for worker_type in workers.keys()):
-            echo("Error: PORT environment variable must be set for web applications", fg='red')
-            exit(1)
-
-        for k, v in safe_defaults.items():
-            if k not in env:
-                env[k] = v
-
-        configure_caddy_for_app(app, env)
-
-        if 'web' in workers:
-            app_address = "{BIND_ADDRESS:s}:{PORT:s}".format(**env)
-            echo(f"-----> App '{app}' will listen on {app_address}", fg='green')
-            env['APP_ADDRESS'] = app_address
-
-    if exists(scaling):
-        worker_count.update({k: int(v) for k, v in parse_procfile(scaling).items() if k in workers})
-
-    to_create = {}
-    to_destroy = {}
-    for k, v in worker_count.items():
-        to_create[k] = range(1, worker_count[k] + 1)
-        if k in deltas and deltas[k]:
-            to_create[k] = range(1, worker_count[k] + deltas[k] + 1)
-            if deltas[k] < 0:
-                to_destroy[k] = range(worker_count[k], worker_count[k] + deltas[k], -1)
-            worker_count[k] = worker_count[k] + deltas[k]
-
-    # Save current settings
-    live_dir = dirname(live)
-    if not exists(live_dir):
-        makedirs(live_dir)
-    write_config(live, env)
-    write_config(scaling, worker_count, ':')
-
-    # Create new workers
-    for k, v in to_create.items():
-        if k == "static":
-            continue  # Skip static workers for systemd unit/symlink creation
-        for w in v:
-            unit_name = f"{app}_{k}.{w}"
-            echo(f"-----> Spawning '{app}:{k}.{w}'", fg='green')
-            
-            for unit in setup_worker(app, k, workers[k], env, w):
-                # Get the basename of the unit file for systemctl commands
-                unit_name = basename(unit)
-                
-                # Set up environment variables for systemd
-                if 'XDG_RUNTIME_DIR' not in environ:
-                    environ['XDG_RUNTIME_DIR'] = f"/run/user/{getuid()}"
-                
-                # Reload systemd to recognize new units
-                call('systemctl --user daemon-reload', shell=True)
-                
-                # Enable and start the unit
-                echo(f"-----> Enabling service: {unit_name}", fg='green')
-                call(f'systemctl --user enable {unit_name}', shell=True)
-                
-                echo(f"-----> Starting service: {unit_name}", fg='green')
-                call(f'systemctl --user start {unit_name}', shell=True)
-
-    # Remove unnecessary workers
-    for k, v in to_destroy.items():
-        for w in v:
-            unit_name = "{app:s}_{k:s}.{w:d}"
-            unit_file = join(SYSTEMD_ROOT, unit_name + '.service')
-
-            if exists(unit_file):
-                echo(f"-----> Terminating '{app:s}:{k:s}.{w:d}'", fg='yellow')
-
-                # Stop and disable the service
-                call(f'systemctl --user stop {unit_name}', shell=True)
-                call(f'systemctl --user disable {unit_name}', shell=True)
-
-                # Check if this is a container file
-            is_container = unit_file.endswith('.service') and exists(unit_file.replace('.service', '.container'))
-
-            if is_container:
-                container_file = unit_file.replace('.service', '.container')
-                quadlet_link = join(environ['HOME'], '.config/systemd/user/containers/systemd', basename(container_file))
-
-                # Remove the quadlet file and symlink
-                if exists(quadlet_link):
-                    unlink(quadlet_link)
-                if exists(container_file):
-                    unlink(container_file)
-                # Run daemon-reload to update systemd
-                call('systemctl --user daemon-reload', shell=True)
-            else:
-                # Remove the regular symlink and unit file
-                if exists(unit_file):
-                    unlink(unit_file)
-
-    return env
-
-
-def resolve_command_path(command, env_path):
-    """Find the absolute path for a command using the specified PATH environment
-    
-    If the command includes arguments, it will split them, resolve the executable path,
-    and return the full command with absolute path.
-    """
-    try:
-        # Check if command has arguments
-        if ' ' in command:
-            # Command has arguments - split to get the executable name
-            cmd_parts = command.split(' ', 1)
-            cmd_executable = cmd_parts[0]
-            cmd_args = cmd_parts[1]
-            
-            # Find absolute path for the executable
-            custom_env = environ.copy()
-            custom_env['PATH'] = env_path
-            abs_executable = command_output(f"which {cmd_executable}").strip()
-            
-            if abs_executable:
-                echo(f"-----> Using absolute path for command: {abs_executable}", fg='green')
-                return f"{abs_executable} {cmd_args}"
-            else:
-                echo(f"Warning: Could not find absolute path for '{cmd_executable}'. Using as is.", fg='yellow')
-                return command
-        else:
-            # No arguments, just resolve the executable
-            custom_env = environ.copy()
-            custom_env['PATH'] = env_path
-            abs_executable = command_output(f"which {command}").strip()
-            
-            if abs_executable:
-                echo(f"-----> Using absolute path for command: {abs_executable}", fg='green')
-                return abs_executable
-            else:
-                echo(f"Warning: Could not find absolute path for '{command}'. Using as is.", fg='yellow')
-                return command
-    except Exception as e:
-        echo(f"Warning: Error finding absolute path for '{command}': {e}", fg='yellow')
-        return command
-
-
-def setup_worker(app, kind, command, env, ordinal=1):
-    """
-    Create a systemd service unit for a worker process.
-    Returns a list of unit files created (paths) that should be enabled and started.
-    Different worker types are handled by specialized functions.
-    """
-    # Normalize inputs
-    app = sanitize_app_name(app)
-    
-    # Dispatch to the appropriate specialized function based on worker type
-    if kind.startswith('cron'):
-        return setup_cron_worker(app, kind, command, env, ordinal)
-    elif kind == 'container':
-        return setup_container_worker(app, kind, command, env, ordinal)
-    else:
-        # Default case: regular worker
-        return setup_regular_worker(app, kind, command, env, ordinal)
-
-
-def setup_worker_environment(app, kind, env, ordinal=1):
-    """Set up the environment for a worker"""
-    env['PROC_TYPE'] = kind
-    app_path = join(APP_ROOT, app)
-    log_file = join(LOG_ROOT, app, f"{kind}.{ordinal}.log")
-    data_path = join(DATA_ROOT, app)
-    venv_path = join(ENV_ROOT, app)
-    
-    # Ensure PATH has virtualenv bin directory at the front
-    if 'PATH' not in env:
-        env['PATH'] = join(venv_path, 'bin') + ':' + environ['PATH']
-    elif join(venv_path, 'bin') not in env['PATH']:
-        env['PATH'] = join(venv_path, 'bin') + ':' + env['PATH']
-    
-    # Make sure virtualenv is set
-    if 'VIRTUAL_ENV' not in env:
-        env['VIRTUAL_ENV'] = venv_path
-    
-    # Create log directory if it doesn't exist
-    log_dir = join(LOG_ROOT, app)
-    if not exists(log_dir):
-        makedirs(log_dir)
-    return app_path, log_file, data_path, venv_path
-
-
-def setup_cron_worker(app, kind, command, env, ordinal=1):
-    """Set up a cron worker using systemd timer"""
-    app_path, log_file, _, _ = setup_worker_environment(app, kind, env, ordinal)
-    
-    # Construct unit name
-    unit_name = f"{app}_{kind}.{ordinal}"
-    
-    # Create timer and service files
-    timer_unit = join(SYSTEMD_ROOT, f"{unit_name}.timer")
-    service_unit = join(SYSTEMD_ROOT, f"{unit_name}.service")
-    
-    # Parse the cron pattern from the command
-    try:
-        cron_parts = command.strip().split(' ', 5)
-        if len(cron_parts) != 6:
-            echo(f"Error: Invalid cron format in command: {command}", fg='red')
-            return []
-            
-        minute, hour, day, month, weekday, cmd = cron_parts
-
-        # Map numeric weekdays to their names for systemd
-        weekday_map = {
-            '0': 'Sun', '1': 'Mon', '2': 'Tue', '3': 'Wed', 
-            '4': 'Thu', '5': 'Fri', '6': 'Sat'
-        }
-        
-        # Format the calendar specification according to systemd's OnCalendar format
-        if weekday != '*':
-            # If weekday is specified, use the weekday format
-            weekday_str = weekday_map.get(weekday, weekday)
-            if day != '*' or month != '*':
-                # Both weekday and specific date - systemd requires both conditions
-                date_str = f"*-{month if month != '*' else '*'}-{day if day != '*' else '*'}"
-                calendar_spec = f"{weekday_str} {date_str} {hour.zfill(2)}:{minute.zfill(2)}:00"
-            else:
-                # Only weekday is specified
-                calendar_spec = f"{weekday_str} *-*-* {hour.zfill(2)}:{minute.zfill(2)}:00"
-        else:
-            # No weekday specified, use date format
-            date_str = f"*-{month if month != '*' else '*'}-{day if day != '*' else '*'}"
-            calendar_spec = f"{date_str} {hour}:{minute.zfill(2)}:00"
-        
-        # Create timer using the template - add Unit directive to point to our service
-        timer_content = SYSTEMD_TIMER_TEMPLATE.format(
-            app_name=app,
-            process_type=kind,
-            calendar_spec=calendar_spec
-        ).replace("[Timer]", "[Timer]\nUnit={}.service".format(unit_name))
-
-        # Convert command to use absolute path for the executable
-        abs_command = resolve_command_path(" ".join(command.split(" ")[5:]), env['PATH'])
-
-        # Create a oneshot service that won't restart
-        service_content = SYSTEMD_APP_TEMPLATE.format(
-            app_name=app,
-            process_type=kind,
-            instance=ordinal,
-            app_path=app_path,
-            port=env.get('PORT', '8000'),
-            environment_vars='\n'.join(['Environment="{}={}"'.format(k, v) for k, v in env.items()]),
-            command=abs_command,  # Use the command with absolute path
-            log_path=log_file
-        ).replace("Restart=always", "Type=oneshot\nRemainAfterExit=no")
-
-        # Write both files
-        with open(timer_unit, 'w', encoding='utf-8') as f:
-            f.write(timer_content)
-        
-        with open(service_unit, 'w', encoding='utf-8') as f:
-            f.write(service_content)
-        
-        echo(f"-----> Created cron timer unit for '{app}:{kind}.{ordinal}'", fg='green')
-        return [service_unit, timer_unit]
-    except Exception as e:
-        echo(f"Error creating cron worker: {str(e)}", fg='red')
-        return []
-
-
-def setup_container_worker(app, kind, command, env, ordinal=1):
-    """Set up a containerized worker using Podman Quadlet"""
-    app_path, log_file, data_path, _ = setup_worker_environment(app, kind, env, ordinal)
-    
-    # Construct unit name and container name
-    unit_name = f"{app}_{kind}.{ordinal}"
-    container_name = f"{app}-{kind}-{ordinal}"
-    
-    # Get ports from environment
-    host_port = env.get('PORT', '8000')
-    container_port = env.get('CONTAINER_PORT', host_port)
-    
-    # Create a .container file in the quadlet directory
-    quadlet_file = join(QUADLET_ROOT, f"{unit_name}.container")
-
-    # Process additional volume mounts and environment variables
-    extra_volumes = ""
-    extra_environment = ""
-    command_section = ""
-
-    # Add volumes and environment variables from env
-    for key, value in env.items():
-        if key.startswith('VOLUME_'):
-            src, dest = value.split(':')
-            extra_volumes += f"Volume={src}:{dest}\n"
-        elif not key.startswith('VOLUME_') and key != 'PORT' and key != 'CONTAINER_PORT':
-            extra_environment += f'Environment="{key}={value}"\n'
-
-    # Add command if specified
-    if command and command.strip() and command != "podman":
-        abs_command = resolve_command_path(command, env['PATH'])
-        command_section = f"Exec={abs_command}"
-
-    # Format quadlet content using the template
-    quadlet_content = QUADLET_CONTAINER_TEMPLATE.format(
-        image=app,
-        container_name=container_name,
-        host_port=host_port,
-        container_port=container_port,
-        app_path=app_path,
-        data_path=data_path,
-        extra_volumes=extra_volumes.strip(),
-        extra_environment=extra_environment.strip(),
-        command_section=command_section,
-        log_path=log_file,
-        app_name=app
-    )
-
-    # Write the quadlet file
-    with open(quadlet_file, 'w', encoding='utf-8') as f:
-        f.write(quadlet_content)
-
-    echo(f"-----> Created container quadlet for '{app}:{kind}.{ordinal}'", fg='green')
-    return [quadlet_file]
-
-
-def setup_regular_worker(app, kind, command, env, ordinal=1):
-    """Set up a regular worker using systemd service"""
-    app_path, log_file, _, _ = setup_worker_environment(app, kind, env, ordinal)
-    
-    # Construct unit name
-    unit_name = f"{app}_{kind}.{ordinal}"
-    
-    # Explicitly include the full PATH environment variable to ensure commands are found
-    environment_vars = '\n'.join(['Environment="{}={}"'.format(k, v) for k, v in env.items()])
-    
-    # Make sure PATH is explicitly included in environment_vars if not already
-    if 'PATH=' not in environment_vars:
-        environment_vars += '\nEnvironment="PATH={}"'.format(env['PATH'])
-    
-    # Convert command to use absolute path for the executable
-    abs_command = resolve_command_path(command, env['PATH'])
-    
-    unit_content = SYSTEMD_APP_TEMPLATE.format(
-        app_name=app,
-        process_type=kind,
-        instance=ordinal,
-        app_path=app_path,
-        port=env.get('PORT', '8000'),
-        environment_vars=environment_vars,
-        command=abs_command,  # Use the command with absolute path
-        log_path=log_file
-    )
-    
-    # Write service file directly to systemd user directory
-    service_file = join(SYSTEMD_ROOT, f"{unit_name}.service")
-    with open(service_file, 'w', encoding='utf-8') as f:
-        f.write(unit_content)
-    
-    echo(f"-----> Created service unit for '{app}:{kind}.{ordinal}'", fg='green')
-    return [service_file]
+    if exists(join(app_path, "docker-compose.yaml")):
+        echo(f"Starting app '{app}'", fg='yellow')
+        # Stop the app using docker-compose
+        call(['docker', 'compose', '-f', join(app_path, 'docker-compose.yaml'), 'up', '-d'],
+             cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
 def do_stop(app):
-    """Stop an app by disabling its systemd services"""
-    app = sanitize_app_name(app)    
-    units = glob(join(SYSTEMD_ROOT, f"{app}_*.service"))
-    timers = glob(join(SYSTEMD_ROOT, f"{app}_*.timer"))
-    container_files = glob(join(QUADLET_ROOT, f"{app}_*.container"))
-    
+    app_path = join(APP_ROOT, app)
+    if exists(join(app_path, "docker-compose.yaml")):
+        echo(f"Stopping app '{app}'", fg='yellow')
+        # Stop the app using docker-compose
+        call(['docker', 'compose', '-f', join(app_path, 'docker-compose.yaml'), 'stop'],
+             cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
 
-    if len(units) > 0 or len(container_files) > 0 or len(timers) > 0:
-        echo(f"Stopping app '{app}'...", fg='yellow')
-
-        # Handle standard service units
-        for unit in units:
-            unit_name = basename(unit)
-            echo(f"-----> Stopping and disabling: {unit_name}", fg='yellow')
-            call(f'systemctl --user stop {unit_name}', shell=True)
-            call(f'systemctl --user disable {unit_name}', shell=True)
-            
-            # Remove the unit file
-            try:
-                unlink(unit)
-                echo(f"-----> Removed unit file: {unit}", fg='green')
-            except Exception as e:
-                echo(f"Warning: Could not remove unit file {unit}: {e}", fg='yellow')
-                
-        # Handle timer units for cron jobs
-        for timer in timers:
-            timer_name = basename(timer)
-            service_name = timer_name.replace('.timer', '.service')
-            echo(f"-----> Stopping and disabling timer: {timer_name}", fg='yellow')
-            call(f'systemctl --user stop {timer_name}', shell=True)
-            call(f'systemctl --user disable {timer_name}', shell=True)
-            
-            # Remove the timer file
-            try:
-                unlink(timer)
-                echo(f"-----> Removed timer file: {timer}", fg='green')
-            except Exception as e:
-                echo(f"Warning: Could not remove timer file {timer}: {e}", fg='yellow')
-            
-            # Also remove the associated service if it exists
-            service_path = join(SYSTEMD_ROOT, service_name)
-            if exists(service_path):
-                try:
-                    unlink(service_path)
-                    echo(f"-----> Removed timer service file: {service_path}", fg='green')
-                except Exception as e:
-                    echo(f"Warning: Could not remove timer service file {service_path}: {e}", fg='yellow')
-
-        # Handle quadlet container files
-        for container_file in container_files:
-            container_name = basename(container_file)
-            service_name = container_name.replace('.container', '.service')
-            
-            echo(f"-----> Stopping and disabling container: {service_name}", fg='yellow')
-            call(f'systemctl --user stop {service_name}', shell=True)
-            call(f'systemctl --user disable {service_name}', shell=True)
-            
-            # Remove the container file
-            try:
-                unlink(container_file)
-                echo(f"-----> Removed container file: {container_file}", fg='green')
-            except Exception as e:
-                echo(f"Warning: Could not remove container file {container_file}: {e}", fg='yellow')
-
-        # Reload systemd to recognize all the changes
-        call('systemctl --user daemon-reload', shell=True)
-        call('systemctl --user reset-failed', shell=True)
-    else:
-        echo(f"Error: app '{app}' not deployed or already stopped!", fg='red')
-
+def do_remove(app):
+    app_path = join(APP_ROOT, app)
+    if exists(join(app_path, "docker-compose.yaml")):
+        call(['docker', 'compose', '-f', join(app_path, 'docker-compose.yaml'),
+              'down', '--rmi', 'all', '--volumes'],
+             cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 def do_restart(app):
     """Restarts a deployed app"""
-    app = sanitize_app_name(app)
-    # Look only in standard locations
-    units = glob(join(SYSTEMD_ROOT, f"{app}_*.service"))
-    container_files = glob(join(QUADLET_ROOT, f"{app}_*.container"))
+    do_stop(app)
+    do_start(app)
+    pass
 
-    if len(units) > 0 or len(container_files) > 0:
-        echo(f"Restarting app '{app}'...", fg='yellow')
+# === CLI Commands ===
 
-        for unit in units:
-            unit_name = basename(unit)
-            echo(f"-----> Restarting service: {unit_name}", fg='yellow')
-            call(f'systemctl --user restart {unit_name}', shell=True)
+@group(context_settings=dict(help_option_names=['-h', '--help']))
+def cli():
+    """Kata: The other smallest PaaS you've ever seen"""
+    pass
 
-        for container_file in container_files:
-            service_name = basename(container_file).replace('.container', '.service')
-            echo(f"-----> Restarting container: {service_name}", fg='yellow')
-            call(f'systemctl --user restart {service_name}', shell=True)
-    else:
-        echo(f"Error: app '{app}' not deployed!", fg='red')
-        do_deploy(app)
+command = cli.command
 
-
-def multi_tail(app, filenames, catch_up=20):
-    """Tails multiple log files"""
-
-    # Seek helper
-    def peek(handle):
-        where = handle.tell()
-        line = handle.readline()
-        if not line:
-            handle.seek(where)
-            return None
-        return line
-
-    inodes = {}
-    files = {}
-    prefixes = {}
-
-    # Set up current state for each log file
-    for f in filenames:
-        prefixes[f] = splitext(basename(f))[0]
-        files[f] = open(f, "rt", encoding="utf-8", errors="ignore")
-        inodes[f] = stat(f).st_ino
-        files[f].seek(0, 2)
-
-    longest = max(map(len, prefixes.values()))
-
-    # Grab a little history (if any)
-    for f in filenames:
-        for line in deque(open(f, "rt", encoding="utf-8", errors="ignore"), catch_up):
-            yield "{} | {}".format(prefixes[f].ljust(longest), line)
-
-    while True:
-        updated = False
-        for f in filenames:
-            line = peek(files[f])
-            if line:
-                updated = True
-                yield "{} | {}".format(prefixes[f].ljust(longest), line)
-
-        if not updated:
-            sleep(1)
-            # Check if logs rotated
-            for f in filenames:
-                if exists(f):
-                    if stat(f).st_ino != inodes[f]:
-                        files[f] = open(f)
-                        inodes[f] = stat(f).st_ino
-                else:
-                    filenames.remove(f)
-
-# === CLI commands ===
-
-CONTEXT_SETTINGS = dict(help_option_names=['-h', '--help'])
-
-
-# --- User commands ---
-
-@command("apps")
+@command('apps')
 def cmd_apps():
     """List apps, e.g.: kata apps"""
     apps = listdir(APP_ROOT)
@@ -1480,509 +570,273 @@ def cmd_apps():
         return
 
     for a in apps:
-        units = glob(join(SYSTEMD_ROOT, '{}*.service'.format(a)))
+        units = glob(join(SYSTEMD_ROOT, f'{a}*.service'))
         running = len(units) != 0
         echo(('*' if running else ' ') + a, fg='green')
 
 
-@command("config")
+@command('config')
 @argument('app')
 def cmd_config(app):
     """Show config, e.g.: kata config <app>"""
-
     app = exit_if_invalid(app)
 
     config_file = join(ENV_ROOT, app, 'ENV')
     if exists(config_file):
         echo(open(config_file).read().strip(), fg='white')
     else:
-        echo("Warning: app '{}' not deployed, no config found.".format(app), fg='yellow')
+        echo(f"Warning: app '{app}' not deployed, no config found.", fg='yellow')
 
 
-@command("config:get")
+@command('config:get')
 @argument('app')
 @argument('setting')
 def cmd_config_get(app, setting):
-    """e.g.: kata config:get <app> FOO"""
-
+    """Get a config setting, e.g.: kata config:get <app> KEY"""
     app = exit_if_invalid(app)
 
     config_file = join(ENV_ROOT, app, 'ENV')
     if exists(config_file):
         env = parse_settings(config_file)
         if setting in env:
-            echo("{}".format(env[setting]), fg='white')
+            echo(env[setting], fg='white')
+        else:
+            echo(f"Error: setting '{setting}' not found", fg='red')
     else:
-        echo("Warning: no active configuration for '{}'".format(app))
+        echo(f"Warning: app '{app}' not deployed, no config found.", fg='yellow')
 
 
-@command("config:set")
+# TODO: ensure we keep .env updated
+
+@command('config:set')
 @argument('app')
-@argument('settings', nargs=-1)
+@argument('settings', nargs=-1, required=True)
 def cmd_config_set(app, settings):
-    """e.g.: kata config:set <app> FOO=bar BAZ=quux"""
-
+    """Set config, e.g.: kata config:set <app> KEY=value"""
     app = exit_if_invalid(app)
 
     config_file = join(ENV_ROOT, app, 'ENV')
-    env = parse_settings(config_file)
-    for s in shsplit(" ".join(settings)):
-        try:
-            k, v = map(lambda x: x.strip(), s.split("=", 1))
-            env[k] = v
-            echo("Setting {k:s}={v} for '{app:s}'".format(**locals()), fg='white')
-        except Exception:
-            echo("Error: malformed setting '{}'".format(s), fg='red')
-            return
-    write_config(config_file, env)
-    do_deploy(app)
+    env = {}
+    if exists(config_file):
+        env = parse_settings(config_file)
 
-
-@command("config:unset")
-@argument('app')
-@argument('settings', nargs=-1)
-def cmd_config_unset(app, settings):
-    """e.g.: kata config:unset <app> FOO"""
-
-    app = exit_if_invalid(app)
-
-    config_file = join(ENV_ROOT, app, 'ENV')
-    env = parse_settings(config_file)
     for s in settings:
-        if s in env:
-            del env[s]
-            echo("Unsetting {} for '{}'".format(s, app), fg='white')
+        try:
+            k, v = s.split('=', 1)
+            env[k] = v
+            echo(f"Setting {k}={v} for '{app}'", fg='white')
+        except Exception:
+            echo(f"Error: malformed setting '{s}'", fg='red')
+            continue
+
     write_config(config_file, env)
     do_deploy(app)
 
 
-@command("config:live")
+@command('config:docker')
 @argument('app')
 def cmd_config_live(app):
-    """e.g.: kata config:live <app>"""
-
+    """Show live config for running app, e.g.: kata config:live <app>"""
     app = exit_if_invalid(app)
 
-    live_config = join(ENV_ROOT, app, 'LIVE_ENV')
-    if exists(live_config):
-        echo(open(live_config).read().strip(), fg='white')
-    else:
-        echo("Warning: app '{}' not deployed, no config found.".format(app), fg='yellow')
+    app_path = join(APP_ROOT, app)
+    echo(f"Docker configuration for app '{app}':", fg='green')
+    with safe_load(join(app_path, 'docker-compose.yaml')) as yaml:
+        echo(safe_dump(yaml, stdout, default_flow_style=False, allow_unicode=True), fg='white')
 
-
-@command("caddy")
-def cmd_caddy():
-    """Display complete Caddy configuration, e.g.: kata caddy"""
-
-    # Get the current Caddy configuration
-    config = get_caddy_config()
-
-    if config:
-        # Pretty print the JSON configuration
-        echo("==== COMPLETE CADDY CONFIGURATION ====", fg='green')
-        echo(dumps(config, indent=2), fg='white')
-    else:
-        echo("No Caddy configuration found. Make sure Caddy is running with the admin API enabled.", fg='yellow')
-        echo("The admin API should be available at localhost:2019.", fg='yellow')
-
-
-@command("caddy:app")
-@argument("app")
+@command('config:caddy')
+@argument('app')
 def cmd_caddy_app(app):
-    """Display Caddy configuration for an app, e.g.: kata caddy:app <app>"""
-
+    """Show Caddy configuration for an app, e.g.: kata config:caddy <app>"""
     app = exit_if_invalid(app)
 
-    # Get the current Caddy configuration for the app
-    config = get_caddy_config(app)
+    app_path = join(APP_ROOT, app)
+    caddy_json = load_caddy_json(app_path)
 
-    if config:
-        # Pretty print the JSON configuration, showing only relevant app section
-        echo("==== CADDY CONFIGURATION FOR '{}' ====".format(app), fg='green')
-        echo(dumps(config, indent=2), fg='white')
-        # TODO: add rest of configuration
+    if caddy_json:
+        echo(f"Caddy configuration for app '{app}':", fg='green')
+        echo(dumps(caddy_json, indent=2), fg='white')
     else:
-        echo("No Caddy configuration found for app '{}'.".format(app), fg='yellow')
-        echo("Deploy the app with a caddy.json file to configure Caddy.", fg='yellow')
-        echo("Or ensure the app has been deployed successfully.", fg='yellow')
+        echo(f"No caddy.json configuration found for app '{app}'", fg='yellow')
 
 
-@command("deploy")
+@command('destroy')
 @argument('app')
-def cmd_deploy(app):
-    """e.g.: kata deploy <app>"""
+@option('--force', '-f', is_flag=True, help='Force destruction without confirmation')
+def cmd_destroy(app, force):
+    """Destroy an app, e.g.: kata destroy <app>"""
+    app = sanitize_app_name(app)
+    app_path = join(APP_ROOT, app)
 
-    app = exit_if_invalid(app)
-    do_deploy(app)
+    if not exists(app_path):
+        echo(f"Error: app '{app}' not deployed!", fg='red')
+        return
 
+    if not force:
+        response = input(f"Are you sure you want to destroy '{app}'? [y/N] ")
+        if response.lower() != 'y':
+            echo("Aborted.", fg='yellow')
+            return
 
-@command("destroy")
-@argument('app')
-def cmd_destroy(app):
-    """e.g.: kata destroy <app>"""
-
-    app = exit_if_invalid(app)
-
-    # Stop services first
-    do_stop(app)
-
-    # Remove Caddy configuration via API
-    remove_caddy_config_for_app(app)
+    # TODO: Remove Caddy configuration
+    do_remove(app)
 
     # Remove app directories
-    for p in [join(x, app) for x in [APP_ROOT, GIT_ROOT, ENV_ROOT, LOG_ROOT, SYSTEMD_ROOT]]:
-        if exists(p):
-            echo("--> Removing folder '{}'".format(p), fg='yellow')
-            rmtree(p)
-
-    # leave DATA_ROOT, since apps may create hard to reproduce data
-    # leave CACHE_ROOT, since apps might use it for important stuff
-    for p in [join(x, app) for x in [DATA_ROOT, CACHE_ROOT]]:
-        if exists(p):
-            echo("==> Preserving folder '{}'".format(p), fg='red')
-
-    # Reload Caddy to remove the app's configuration
-    if exists('/etc/systemd/system/caddy.service'):
-        echo("-----> Reloading Caddy configuration")
-        call('systemctl reload caddy', shell=True)
-
-@command("logs")
-@argument('app')
-def cmd_logs(app, process='*', follow=False, include_journal=True, startup_only=False):
-    """View application logs, e.g: kata logs <app> [<process>]
-    
-    Use -f or --follow to follow logs in real-time.
-    Use -s or --startup to show only startup/error logs.
-    """
-    app = exit_if_invalid(app)
-    
-    # Debug what we received (uncomment to troubleshoot)
-    # echo(f"DEBUG: Received app argument: '{app}'", fg='yellow')
-    
-    # Parse arguments from app string if provided via SSH
-    if ' ' in app:
-        parts = app.split(' ')
-        app = sanitize_app_name(parts[0])
-        
-        # First non-flag argument after app name is the process name
-        process_set = False
-        for part in parts[1:]:
-            if part in ['-f', '--follow']:
-                follow = True
-            elif part in ['-s', '--startup']:
-                startup_only = True
-            elif part.startswith('-'):
-                continue  # Skip other flags
-            elif not process_set:  # Only set process once
-                process = part
-                process_set = True
-                # Add explicit debug output
-                echo(f"Setting process filter to: '{process}'", fg='green')
-    
-    # Define unit pattern for both modes - use exact pattern for process
-    if process == '*':
-        unit_pattern = f"{app}_*.service"
-        log_pattern = f"{process}.*.log"
-    else:
-        # For exact process matching, be specific about the service pattern
-        unit_pattern = f"{app}_{process}.*.service"
-        log_pattern = f"{process}.*.log"
-    
-    # Add debug output to confirm pattern
-    echo(f"Looking for systemd units matching: {unit_pattern}", fg='green')
-    
-    # For follow mode, we need special handling
-    if follow:
-        echo(f"-----> Following logs for '{app}' worker '{process}'", fg='green')
-        
-        # Get the log files
-        logfiles = glob(join(LOG_ROOT, app, f"{process}.*.log"))
-        
-        # Start a background process for journalctl if needed
-        journal_proc = None
-        if include_journal:
+    for path in [
+        join(APP_ROOT, app),
+        join(ENV_ROOT, app),
+        join(LOG_ROOT, app),
+        join(GIT_ROOT, app),
+        join(DATA_ROOT, app)
+    ]:
+        if exists(path):
             try:
-                check_cmd = f"systemctl --user list-units {unit_pattern} --no-legend"
-                units_output = command_output(check_cmd)
-                
-                if units_output.strip():
-                    echo(f"-----> Following systemd journal logs", fg='green')
-                    journal_cmd = f"journalctl --user -f -u {unit_pattern}"
-                    journal_proc = Popen(journal_cmd, shell=True)
+                rmtree(path)
+                echo(f"Removed {path}", fg='green')
             except Exception as e:
-                echo(f"Error starting journal follow: {str(e)}", fg='red')
-        
-        # Now follow the log files if they exist
-        if logfiles:
-            try:
-                echo(f"-----> Following file logs", fg='green')
-                try:
-                    # Use an infinite loop since multi_tail is a generator
-                    for line in multi_tail(app, logfiles):
-                        echo(line.strip(), fg='white')
-                except KeyboardInterrupt:
-                    # Stop the journal process if it's running
-                    if journal_proc:
-                        journal_proc.terminate()
-                    echo("\nStopped following logs", fg='yellow')
-                    return
-            finally:
-                # Make sure to clean up
-                if journal_proc:
-                    journal_proc.terminate()
-        else:
-            # If no log files, just wait on the journal process
-            if journal_proc:
-                try:
-                    journal_proc.wait()
-                except KeyboardInterrupt:
-                    journal_proc.terminate()
-                    echo("\nStopped following logs", fg='yellow')
-            else:
-                echo("No logs found to follow.", fg='yellow')
-        return
-        
-    # Non-follow mode (startup/journal logs)
-    if startup_only or include_journal:
-        echo(f"-----> Startup logs for '{app}' worker '{process}'", fg='green')
-        try:
-            # Get a list of all matching units with direct glob instead of parsing systemctl output
-            units = glob(join(SYSTEMD_ROOT, unit_pattern))
-            
-            if units:
-                # Show what we found
-                echo(f"Found {len(units)} matching systemd units", fg='green')
-                # Just use the basenames of the files as the unit names
-                unit_names = [basename(unit) for unit in units]
-                
-                # For each unit, show its status and recent logs
-                for unit_name in unit_names:
-                    # Get unit status
-                    status_cmd = f"systemctl --user status {unit_name} --no-pager"
-                    status_output = command_output(status_cmd)
-                    
-                    echo(f"\n=== LOGS FOR {unit_name} ===", fg='green')
-                    
-                    if "Failed" in status_output or "error" in status_output.lower():
-                        echo(f"SERVICE STATUS:", fg='yellow')
-                        # Extract and show the specific error
-                        for line in status_output.split('\n'):
-                            if "Failed" in line or "error" in line.lower():
-                                echo(line.strip(), fg='red')
-                    
-                    # Get journal logs for this unit
-                    log_cmd = f"journalctl --user -u {unit_name} --no-pager -n 25"
-                    # Add flags to get more startup info
-                    if startup_only:
-                        log_cmd += " -p err..emerg"  # Only show error, critical, alert, and emergency messages
-                    
-                    journal_output = command_output(log_cmd)
-                    if journal_output.strip():
-                        echo(f"JOURNAL LOGS:", fg='yellow')
-                        echo(journal_output.strip(), fg='white')
-                    else:
-                        echo("No journal logs found for this unit", fg='yellow')
-            else:
-                echo(f"No systemd units found matching {unit_pattern}", fg='yellow')
-        except Exception as e:
-            echo(f"Error retrieving systemd logs: {str(e)}", fg='red')
-    
-    # If not just looking for startup errors, show regular file logs
-    if not startup_only:
-        echo(f"\n-----> File logs for '{app}' worker '{process}'", fg='green')
-        logfiles = glob(join(LOG_ROOT, app, log_pattern))
-        if len(logfiles) > 0:
-            echo(f"Found {len(logfiles)} matching log files", fg='green')
-            for line in multi_tail(app, logfiles):
-                echo(line.strip(), fg='white')
-        else:
-            echo(f"No log files found for app '{app}' with process pattern '{process}'.", fg='yellow')
+                echo(f"Error removing {path}: {str(e)}", fg='red')
+
+    echo(f"App '{app}' destroyed", fg='green')
 
 
-@command("ps")
+@command('logs')
 @argument('app')
+@option('--follow', '-f', is_flag=True, help='Follow log output')
+@option('--service', '-s', 'service_pattern', help='Show logs for services matching pattern')
+def cmd_logs(app, follow, service):
+    """Show logs for an app, e.g.: kata logs <app>"""
+    app = exit_if_invalid(app)
+
+    call(['docker', 'compose', '-f', join(APP_ROOT, app, 'docker-compose.yaml'), 'logs',
+          '{follow}'.format(follow='-f' if follow else ''),
+          '{service}'.format(service=service or '')],
+          stdout=stdout, stderr=stderr, universal_newlines=True)
+
+@command('ps')
+@argument('app', required=False)
 def cmd_ps(app):
-    """Show process count, e.g: kata ps <app>"""
+    """List processes, e.g.: kata ps [<app>]"""
 
     app = exit_if_invalid(app)
+    call(['docker', 'compose', '-f', join(APP_ROOT, app, 'docker-compose.yaml'), 'ps'],
+         stdout=stdout, stderr=stderr, universal_newlines=True)
 
-    config_file = join(ENV_ROOT, app, 'SCALING')
-    if exists(config_file):
-        echo(open(config_file).read().strip(), fg='white')
-    else:
-        echo("Error: no workers found for app '{}'.".format(app), fg='red')
-
-
-@command("ps:scale")
+@command('run')
 @argument('app')
-@argument('settings', nargs=-1)
-def cmd_ps_scale(app, settings):
-    """e.g.: kata ps:scale <app> <proc>=<count>"""
-
+@argument('service', required=True)
+@argument('command', nargs=-1, required=True)
+def cmd_run(app, service, command):
+    """Run a command in the app environment, e.g.: kata run <app> <command>"""
     app = exit_if_invalid(app)
 
-    config_file = join(ENV_ROOT, app, 'SCALING')
-    worker_count = {k: int(v) for k, v in parse_procfile(config_file).items()}
-    deltas = {}
-    for s in settings:
-        try:
-            k, v = map(lambda x: x.strip(), s.split("=", 1))
-            c = int(v)  # check for integer value
-            if c < 0:
-                echo("Error: cannot scale type '{}' below 0".format(k), fg='red')
-                return
-            if k not in worker_count:
-                echo("Error: worker type '{}' not present in '{}'".format(k, app), fg='red')
-                return
-            deltas[k] = c - worker_count[k]
-        except Exception:
-            echo("Error: malformed setting '{}'".format(s), fg='red')
-            return
-    do_deploy(app, deltas)
+    call(['docker', 'compose', '-f', join(APP_ROOT, app, 'docker-compose.yaml'), 'run', service] + list(command),
+         stdout=stdout, stderr=stderr, universal_newlines=True)
 
+@command('parse')
+@argument('filename', type=Path(exists=True))
+def parse_file(filename):
+    """Parse a YAML file, e.g.: kata parse <filename>"""
+    echo(f"Parsing file: {filename}", fg='green')
+    try:
+        data, caddy = parse_yaml("sample", filename)
+        if data:
+            echo("Parsed data:", fg='green')
+            echo(safe_dump(data, default_flow_style=False), fg='white')
+        else:
+            echo("No valid data found in the file", fg='yellow')
 
-@command("run")
-@argument('app')
-@argument('cmd', nargs=-1)
-def cmd_run(app, cmd):
-    """e.g.: kata run <app> ls -- -al"""
+        if caddy:
+            echo("Parsed Caddy configuration:", fg='green')
+            echo(safe_dump(caddy, default_flow_style=False), fg='white')
 
-    app = exit_if_invalid(app)
+    except Exception as e:
+        echo(f"Error parsing file: {str(e)}", fg='red')
 
-    config_file = join(ENV_ROOT, app, 'LIVE_ENV')
-    environ.update(parse_settings(config_file))
-    for f in [stdout, stderr]:
-        fl = fcntl(f, F_GETFL)
-        fcntl(f, F_SETFL, fl | O_NONBLOCK)
-    p = Popen(' '.join(cmd), stdin=stdin, stdout=stdout, stderr=stderr, env=environ, cwd=join(APP_ROOT, app), shell=True)
-    p.communicate()
-
-
-@command("restart")
+@command('restart')
 @argument('app')
 def cmd_restart(app):
-    """Restart an app: kata restart <app>"""
-
+    """Restart an app, e.g.: kata restart <app>"""
     app = exit_if_invalid(app)
-
     do_restart(app)
 
 
-@command("stop")
+@command('stop')
 @argument('app')
 def cmd_stop(app):
-    """Stop an app, e.g: kata stop <app>"""
+    """Stop an app, e.g.: kata stop <app>"""
     app = exit_if_invalid(app)
     do_stop(app)
 
 
-@command("setup")
+@command('setup')
 def cmd_setup():
-    """Initialize environment"""
-
-    echo("Running in Python {}".format(".".join(map(str, version_info))))
-
-    # Create required paths
-    for p in [APP_ROOT, CACHE_ROOT, DATA_ROOT, GIT_ROOT, ENV_ROOT, SYSTEMD_ROOT, QUADLET_ROOT, LOG_ROOT, CADDY_ROOT, PODMAN_ROOT, ACME_WWW]:
-        if not exists(p):
-            echo("Creating '{}'.".format(p), fg='green')
-            makedirs(p)
-
-    # Check for required binaries
-    requirements = ['caddy', 'podman', 'podman-compose']
-    missing = []
-    for req in requirements:
-        if not which(req):
-            missing.append(req)
-
-    if missing:
-        echo("Warning: Missing required binaries: {}".format(', '.join(missing)), fg='yellow')
-        echo("You'll need to install these packages before using Kata", fg='yellow')
-
-    # Verify podman-system-generator is available for quadlet integration
-    podman_generator = False
-    for path in ['/usr/lib/systemd/system-generators/podman-system-generator',
-                 '/usr/local/lib/systemd/system-generators/podman-system-generator']:
-        if exists(path):
-            podman_generator = True
-            break
-
-    if not podman_generator:
-        echo("Warning: podman-system-generator not found.", fg='yellow')
-        echo("Container quadlet functionality may not work correctly.", fg='yellow')
-        echo("Make sure you have a recent version of podman with quadlet support.", fg='yellow')
-
-    # mark this script as executable (in case we were invoked via interpreter)
-    if not (stat(KATA_SCRIPT).st_mode & S_IXUSR):
-        echo("Setting '{}' as executable.".format(KATA_SCRIPT), fg='yellow')
-        chmod(KATA_SCRIPT, stat(KATA_SCRIPT).st_mode | S_IXUSR)
+    """Setup kata environment, e.g.: kata setup"""
+    for f in ROOT_FOLDERS:
+        d = globals()[f]
+        if not exists(d):
+            makedirs(d)
+            echo(f"Created {d}", fg='green')
+    echo("Kata setup complete", fg='green')
 
 
-@command("setup:ssh")
-@argument('public_key_file')
-def cmd_setup_ssh(public_key_file):
-    """Set up a new SSH key (use - for stdin)"""
-
-    def add_helper(key_file):
-        if exists(key_file):
-            try:
-                fingerprint = str(check_output('ssh-keygen -lf ' + key_file, shell=True)).split(' ', 4)[1]
-                key = open(key_file, 'r', encoding='utf-8').read().strip()
-                echo(f"Adding key '{fingerprint}'.", fg='white')
-                setup_authorized_keys(fingerprint, KATA_SCRIPT, key)
-            except Exception:
-                echo(f"Error: invalid public key file '{key_file}': {format_exc()}", fg='red')
-        elif public_key_file == '-':
-            buffer = "".join(stdin.readlines())
-            with NamedTemporaryFile(mode="w") as f:
-                f.write(buffer)
-                f.flush()
-                add_helper(f.name)
+@command('setup:ssh')
+@argument('pubkey', required=False)
+def cmd_setup_ssh(pubkey):
+    """Setup SSH keys, e.g.: kata setup:ssh [pubkey]"""
+    if not pubkey:
+        # Look for an existing public key
+        default_key = join(environ['HOME'], '.ssh', 'id_rsa.pub')
+        if exists(default_key):
+            with open(default_key, 'r', encoding='utf-8') as f:
+                pubkey = f.read().strip()
         else:
-            echo("Error: public key file '{}' not found.".format(key_file), fg='red')
+            echo("No public key provided and no default key found", fg='red')
+            echo("Generate one with: ssh-keygen -t rsa", fg='yellow')
+            return
+    try:
+        fingerprint = check_output(['ssh-keygen', '-lf', '-'],
+                                  input=pubkey.encode('utf-8'),
+                                  stderr=STDOUT,
+                                  universal_newlines=True).split()[1]
+    except Exception as e:
+        echo(f"Invalid public key format ({str(e)})", fg='red')
+        return
+    try:
+        setup_authorized_keys(fingerprint, KATA_SCRIPT, pubkey)
+        echo("SSH key setup complete", fg='green')
+    except Exception as e:
+        echo(f"Error setting up SSH keys: {str(e)}", fg='red')
 
-    add_helper(public_key_file)
 
-
-@command("setup:caddy")
-def cmd_setup_caddy():
-    """Setup caddy.json template file for apps"""
-    # Display a sample caddy.json file with environment variable support
-    sample = {
-        "listen": [":$PORT"],
-        "routes": [{
-            "match": [{
-                "host": ["$DOMAIN_NAME"]
-            }],
-            "handle": [{
-                "handler": "reverse_proxy",
-                "upstreams": [{
-                    "dial": "$BIND_ADDRESS:$PORT"
-                }]
-            }]
-        }]
-    }
-    echo("\nSample caddy.json file (place this in your app directory):", fg="green")
-    echo(dumps(sample, indent=2), fg="white")
-    echo("\nEnvironment variables like $PORT, $DOMAIN_NAME, etc. will be replaced with actual values.", fg="yellow")
-    echo("Make sure to set PORT in your ENV file.\n", fg="yellow")
-
-@command("update")
+@command('update')
 def cmd_update():
-    """Update the kata server script"""
-    echo("Updating kata...")
+    """Update kata to the latest version, e.g.: kata update"""
+    try:
+        # Download the latest version
+        echo("Downloading latest version...", fg='green')
+        response = HTTPSConnection('raw.githubusercontent.com').request('GET', KATA_RAW_SOURCE_URL)
 
-    with NamedTemporaryFile(mode="w") as f:
-        tempfile = f.name
-        cmd = """curl -sL -w %{{http_code}} {} -o {}""".format(KATA_RAW_SOURCE_URL, tempfile)
-        response = check_output(cmd.split(' '), stderr=STDOUT)
-        http_code = response.decode('utf8').strip()
-        if http_code == "200":
-            copyfile(tempfile, KATA_SCRIPT)
-            echo("Update successful.")
+        if response.status_code == 200:
+            # Create a backup of the current script
+            backup_file = f"{KATA_SCRIPT}.backup"
+            copyfile(KATA_SCRIPT, backup_file)
+            echo(f"Created backup at {backup_file}", fg='green')
+
+            # Write the new version
+            with open(KATA_SCRIPT, 'w', encoding='utf-8') as f:
+                f.write(response.text)
+
+            # Make it executable
+            chmod(KATA_SCRIPT, S_IRUSR | S_IWUSR | S_IXUSR)
+
+            echo("Update complete! Restart any running kata processes.", fg='green')
         else:
-            echo(f"Error updating kata - please check if {KATA_RAW_SOURCE_URL} is accessible from this machine.", fg='red')
-    echo("Done.")
+            echo(f"Failed to download update: HTTP {response.status_code}", fg='red')
+    except ImportError:
+        echo("Error: requests module not installed", fg='red')
+        echo("Install it with: pip install requests", fg='yellow')
+    except Exception as e:
+        echo(f"Error updating kata: {str(e)}", fg='red')
 
 # --- Internal commands ---
 
@@ -2008,6 +862,7 @@ def cmd_git_hook(app):
                 makedirs(data_path)
             call("git clone --quiet {} {}".format(repo_path, app), cwd=APP_ROOT, shell=True)
         do_deploy(app, newrev=newrev)
+
 
 @command("git-receive-pack")
 @argument('app')
@@ -2043,10 +898,10 @@ def cmd_git_upload_pack(app):
     call('git-shell -c "{}" '.format(argv[1] + " '{}'".format(app)), cwd=GIT_ROOT, shell=True)
 
 @command("scp")
-@pass_context
-def cmd_scp(ctx):
+@argument('args', nargs=-1, required=True)
+def cmd_scp(args):
     """Simple wrapper to allow scp to work."""
-    call(" ".join(["scp"] + ctx["args"]), cwd=GIT_ROOT, shell=True)
+    call(["scp"] + list(args), cwd=abspath(environ['HOME']))
 
 @command("help")
 def cmd_help():
@@ -2055,4 +910,4 @@ def cmd_help():
 
 if __name__ == '__main__':
     # Run the CLI with all registered commands
-    run_cli()
+    cli()
