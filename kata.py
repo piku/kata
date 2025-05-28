@@ -49,6 +49,7 @@ GIT_ROOT = abspath(join(KATA_ROOT, "repos"))
 LOG_ROOT = abspath(join(KATA_ROOT, "logs"))
 ENV_ROOT = abspath(join(KATA_ROOT, "envs"))
 DOCKER_COMPOSE = ".docker-compose.yaml"
+KATA_COMPOSE = "kata-compose.yaml"
 
 ROOT_FOLDERS = ['APP_ROOT', 'DATA_ROOT', 'ENV_ROOT', 'CONFIG_ROOT', 'GIT_ROOT', 'LOG_ROOT']
 
@@ -80,7 +81,7 @@ CMD ['python', '-m', 'app']
 """
 
 RUNTIME_IMAGES = {
-    'python': PYTHON_DOCKERFILE,
+    'kata/python': PYTHON_DOCKERFILE,
 }
 
 COMPOSE_TEMPLATE = """
@@ -223,22 +224,43 @@ def docker_create_runtime_image(image_name, dockerfile_content):
     finally:
         remove(dockerfile_path)
 
-
-def docker_prepare_runtime_environment(app_name, runtime, env=None):
+def docker_handle_runtime_environment(app_name, runtime, destroy=False, env=None):
+    image = f"kata/{runtime}"
+    if docker_create_runtime_image(image, RUNTIME_IMAGES[image]):
+        echo(f"Created Docker image for runtime '{runtime}'", fg='green')
     volumes = [
         "-v", f"{join(APP_ROOT, app_name)}:/app",
         "-v", f"{join(CONFIG_ROOT, app_name)}:/config",
         "-v", f"{join(DATA_ROOT, app_name)}:/data",
         "-v", f"{join(ENV_ROOT, app_name)}:/venv"
     ]
-    cmds = {
-        'python': [['python', '-m', 'venv', '/venv'], ['pip', 'install', '-r', '/app/requirements.txt']]
-    }
+    if destroy:
+        cmds = {
+            'python': [['rm', '-rf', '/venv/*']]
+        }
+    else:
+        cmds = {
+            'python': [['python3', '-m', 'venv', '/venv'], ['pip3', 'install', '-r', '/app/requirements.txt']]
+        }
     ### Mount the required volumes and run the docker image for the runtime environment
-    echo(f"Preparing runtime environment for '{app_name}' with '{runtime}'", fg='green')
     for cmd in cmds[runtime]:
         call(['docker', 'run'] + volumes + ['-i', f'kata/{runtime}'] + cmd,
          cwd=join(APP_ROOT, app_name), env=env, stdout=stdout, stderr=stderr, universal_newlines=True)
+
+def docker_cleanup_runtime_environment(app_name, runtime):
+    """Cleans up the Docker environment for an app"""
+    app_path = join(APP_ROOT, app_name)
+    if exists(app_path):
+        echo(f"Cleaning up Docker environment for '{app_name}'", fg='green')
+        # Remove the Docker volumes associated with the app
+        volumes = ['app', 'config', 'data', 'venv']
+        for volume in volumes:
+            volume_path = join(app_path, volume)
+            if exists(volume_path):
+                rmtree(volume_path, ignore_errors=True)
+                echo(f"Removed volume '{volume}' for app '{app_name}'", fg='green')
+    else:
+        echo(f"App '{app_name}' does not exist, skipping cleanup.", fg='yellow')
 
 # === App Management ===
 
@@ -299,17 +321,12 @@ def parse_yaml(app_name, filename) -> tuple:
         if not "image" in service:
             echo(f"Warning: service '{service_name}' in {filename} has no 'image' specified", fg='yellow')
             if "runtime" in service:
-                service["image"] = join("kata", service["runtime"])
-                if not docker_check_image_exists(join("kata", service["runtime"])):
-                    if service["runtime"] in RUNTIME_IMAGES:
-                        if docker_create_runtime_image(join("kata", service["runtime"]), RUNTIME_IMAGES[service["runtime"]]):
-                            echo(f"Created Docker image for runtime '{service['runtime']}'", fg='green')
-                            service["image"] = join("kata",service["runtime"])
-                        echo(f"Preparing runtime environment for '{app_name}' with '{service['runtime']}'", fg='green')
-                        docker_prepare_runtime_environment(app_name, service["runtime"], env)
-                    else:
-                        echo(f"Error: runtime '{service['runtime']}' not supported", fg='red')
-                        exit(1)
+                service["image"] = f"kata/{service["runtime"]}"
+                if service["image"] in RUNTIME_IMAGES:
+                    docker_handle_runtime_environment(app_name, service["runtime"], env=env)
+                else:
+                    echo(f"Error: runtime '{service['runtime']}' not supported", fg='red')
+                    exit(1)
                 del service["runtime"]
             if not "volumes" in service:
                 echo(f"Warning: service '{service_name}' in {filename} has no 'volumes' specified", fg='yellow')
@@ -511,7 +528,7 @@ def do_deploy(app, deltas={}, newrev=None):
     """Deploy an app by resetting the work directory"""
 
     app_path = join(APP_ROOT, app)
-    compose_file = join(app_path, 'kata-compose.yaml')
+    compose_file = join(app_path, KATA_COMPOSE)
 
     env = {'GIT_WORK_DIR': app_path}
     if exists(app_path):
@@ -552,6 +569,13 @@ def do_remove(app):
         call(['docker', 'compose', '-f', join(app_path, DOCKER_COMPOSE),
               'down', '--rmi', 'all', '--volumes'],
              cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
+        yaml = safe_load(open(join(app_path, KATA_COMPOSE), 'r', encoding='utf-8').read())
+        if 'services' in yaml:
+            for service_name, service in yaml['services'].items():
+                echo("Removing service: " + service_name, fg='yellow')
+                if 'runtime' in service:
+                    runtime = service['runtime']
+                    docker_handle_runtime_environment(app, runtime, destroy=True)
 
 def do_restart(app):
     """Restarts a deployed app"""
