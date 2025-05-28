@@ -48,6 +48,7 @@ CONFIG_ROOT = abspath(join(KATA_ROOT, "config"))
 GIT_ROOT = abspath(join(KATA_ROOT, "repos"))
 LOG_ROOT = abspath(join(KATA_ROOT, "logs"))
 ENV_ROOT = abspath(join(KATA_ROOT, "envs"))
+DOCKER_COMPOSE = ".docker-compose.yaml"
 
 ROOT_FOLDERS = ['APP_ROOT', 'DATA_ROOT', 'ENV_ROOT', 'CONFIG_ROOT', 'GIT_ROOT', 'LOG_ROOT']
 
@@ -74,7 +75,8 @@ ENV VIRTUAL_ENV=/venv
 ENV PATH=/venv/bin:$PATH
 VOLUME ["/app", "/config", "/data", "/venv"]
 EXPOSE 8080
-CMD ["python", "-m", "app"]
+WORKDIR /app
+CMD ['python', '-m', 'app']
 """
 
 RUNTIME_IMAGES = {
@@ -221,6 +223,23 @@ def docker_create_runtime_image(image_name, dockerfile_content):
     finally:
         remove(dockerfile_path)
 
+
+def docker_prepare_runtime_environment(app_name, runtime, env=None):
+    volumes = [
+        "-v", f"{join(APP_ROOT, app_name)}:/app",
+        "-v", f"{join(CONFIG_ROOT, app_name)}:/config",
+        "-v", f"{join(DATA_ROOT, app_name)}:/data",
+        "-v", f"{join(ENV_ROOT, app_name)}:/venv"
+    ]
+    cmds = {
+        'python': [['python', '-m', 'venv', '/venv'], ['pip', 'install', '-r', '/app/requirements.txt']]
+    }
+    ### Mount the required volumes and run the docker image for the runtime environment
+    echo(f"Preparing runtime environment for '{app_name}' with '{runtime}'", fg='green')
+    for cmd in cmds[runtime]:
+        call(['docker', 'run'] + volumes + ['-i', f'kata/{runtime}'] + cmd,
+         cwd=join(APP_ROOT, app_name), env=env, stdout=stdout, stderr=stderr, universal_newlines=True)
+
 # === App Management ===
 
 def exit_if_invalid(app, deployed=False):
@@ -267,7 +286,7 @@ def parse_yaml(app_name, filename) -> tuple:
 
     env = {}
     if "environment" in data:
-        env = data["environment"]
+        env = {k: str(v) for k, v in data["environment"].items()}
 
     env = base_env(app_name, env)
     env_dump = [f"{k}={v}" for k, v in env.items()]
@@ -284,11 +303,17 @@ def parse_yaml(app_name, filename) -> tuple:
                 if not docker_check_image_exists(join("kata", service["runtime"])):
                     if service["runtime"] in RUNTIME_IMAGES:
                         if docker_create_runtime_image(join("kata", service["runtime"]), RUNTIME_IMAGES[service["runtime"]]):
+                            echo(f"Created Docker image for runtime '{service['runtime']}'", fg='green')
                             service["image"] = join("kata",service["runtime"])
+                        echo(f"Preparing runtime environment for '{app_name}' with '{service['runtime']}'", fg='green')
+                        docker_prepare_runtime_environment(app_name, service["runtime"], env)
                     else:
                         echo(f"Error: runtime '{service['runtime']}' not supported", fg='red')
                         exit(1)
                 del service["runtime"]
+            if not "volumes" in service:
+                echo(f"Warning: service '{service_name}' in {filename} has no 'volumes' specified", fg='yellow')
+                service["volumes"] = ["app:/app", "config:/config", "data:/data", "venv:/venv"]
         if not "command" in service:
             echo(f"Warning: service '{service_name}' in {filename} has no 'command' specified", fg='yellow')
             continue
@@ -300,26 +325,6 @@ def parse_yaml(app_name, filename) -> tuple:
             service["environment"] = {}
         service["environment"].update(env)
 
-    # prepend app name to service names, links and depends_on
-    old = []
-    new_services = {}
-    for service_name in services.keys():
-        if not service_name.startswith(app_name + '-'):
-            old.append(service_name)
-            new_name = app_name + '-' + service_name
-            new_services[new_name] = services[service_name].copy()
-            if "links" in new_services[new_name]:
-                # prepend app name to links
-                for i, link in enumerate(new_services[new_name]["links"]):
-                    if not link.startswith(app_name + '-'):
-                        new_services[new_name]["links"][i] = app_name + '-' + link
-
-            if "depends_on" in new_services[new_name]:
-                for i, depends_on in enumerate(new_services[new_name]["depends_on"]):
-                    if not depends_on.startswith(app_name + '-'):
-                        new_services[new_name]["depends_on"][i] = app_name + '-' + depends_on
-    data["services"] = new_services
-
     caddy_config = {}
     if "caddy" in data.keys():
         caddy_config = data.get("caddy", {})
@@ -330,7 +335,7 @@ def parse_yaml(app_name, filename) -> tuple:
     if not "volumes" in data.keys():
         volumes = {
             "app": join(APP_ROOT, app_name),
-            "config": join(ENV_ROOT, app_name),
+            "config": join(CONFIG_ROOT, app_name),
             "data": join(DATA_ROOT, app_name),
             "venv": join(ENV_ROOT, app_name)
         }
@@ -517,7 +522,7 @@ def do_deploy(app, deltas={}, newrev=None):
         call('git submodule init', cwd=app_path, env=env, shell=True)
         call('git submodule update', cwd=app_path, env=env, shell=True)
         compose, caddy = parse_yaml(app, compose_file)
-        with open(join(APP_ROOT, app, "docker-compose.yaml"), "w", encoding='utf-8') as f:
+        with open(join(APP_ROOT, app, DOCKER_COMPOSE), "w", encoding='utf-8') as f:
             f.write(safe_dump(compose))
         caddy_config(app, caddy)
         do_start(app)
@@ -526,25 +531,25 @@ def do_deploy(app, deltas={}, newrev=None):
 
 def do_start(app):
     app_path = join(APP_ROOT, app)
-    if exists(join(app_path, "docker-compose.yaml")):
+    if exists(join(app_path, DOCKER_COMPOSE)):
         echo(f"Starting app '{app}'", fg='yellow')
         # Stop the app using docker-compose
-        call(['docker', 'compose', '-f', join(app_path, 'docker-compose.yaml'), 'up', '-d'],
+        call(['docker', 'compose', '-f', join(app_path, DOCKER_COMPOSE), 'up', '-d'],
              cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
 def do_stop(app):
     app_path = join(APP_ROOT, app)
-    if exists(join(app_path, "docker-compose.yaml")):
+    if exists(join(app_path, DOCKER_COMPOSE)):
         echo(f"Stopping app '{app}'", fg='yellow')
         # Stop the app using docker-compose
-        call(['docker', 'compose', '-f', join(app_path, 'docker-compose.yaml'), 'stop'],
+        call(['docker', 'compose', '-f', join(app_path, DOCKER_COMPOSE), 'stop'],
              cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 def do_remove(app):
     app_path = join(APP_ROOT, app)
-    if exists(join(app_path, "docker-compose.yaml")):
-        call(['docker', 'compose', '-f', join(app_path, 'docker-compose.yaml'),
+    if exists(join(app_path, DOCKER_COMPOSE)):
+        call(['docker', 'compose', '-f', join(app_path, DOCKER_COMPOSE),
               'down', '--rmi', 'all', '--volumes'],
              cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
 
@@ -643,8 +648,7 @@ def cmd_config_live(app):
 
     app_path = join(APP_ROOT, app)
     echo(f"Docker configuration for app '{app}':", fg='green')
-    with safe_load(join(app_path, 'docker-compose.yaml')) as yaml:
-        echo(safe_dump(yaml, stdout, default_flow_style=False, allow_unicode=True), fg='white')
+    echo(open(join(app_path, DOCKER_COMPOSE), 'r', encoding='utf-8').read().strip(), fg='white')
 
 
 @command('config:caddy')
@@ -708,12 +712,12 @@ def cmd_destroy(app, force):
 @command('logs')
 @argument('app')
 @option('--follow', '-f', is_flag=True, help='Follow log output')
-@option('--service', '-s', 'service_pattern', help='Show logs for services matching pattern')
+@option('--service', '-s', 'service', help='Show logs for services matching pattern')
 def cmd_logs(app, follow, service):
     """Show logs for an app, e.g.: kata logs <app>"""
     app = exit_if_invalid(app)
 
-    call(['docker', 'compose', '-f', join(APP_ROOT, app, 'docker-compose.yaml'), 'logs',
+    call(['docker', 'compose', '-f', join(APP_ROOT, app, DOCKER_COMPOSE), 'logs',
           '{follow}'.format(follow='-f' if follow else ''),
           '{service}'.format(service=service or '')],
           stdout=stdout, stderr=stderr, universal_newlines=True)
@@ -724,7 +728,7 @@ def cmd_ps(app):
     """List processes, e.g.: kata ps [<app>]"""
 
     app = exit_if_invalid(app)
-    call(['docker', 'compose', '-f', join(APP_ROOT, app, 'docker-compose.yaml'), 'ps'],
+    call(['docker', 'compose', '-f', join(APP_ROOT, app, DOCKER_COMPOSE), 'ps'],
          stdout=stdout, stderr=stderr, universal_newlines=True)
 
 @command('run')
@@ -735,7 +739,7 @@ def cmd_run(app, service, command):
     """Run a command in the app environment, e.g.: kata run <app> <command>"""
     app = exit_if_invalid(app)
 
-    call(['docker', 'compose', '-f', join(APP_ROOT, app, 'docker-compose.yaml'), 'run', service] + list(command),
+    call(['docker', 'compose', '-f', join(APP_ROOT, app, DOCKER_COMPOSE), 'run', service] + list(command),
          stdout=stdout, stderr=stderr, universal_newlines=True)
 
 @command('parse')

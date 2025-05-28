@@ -10,9 +10,7 @@ test: ## Run local test
 
 deploy: ## Push to test
 	# POST entire kata.py to home server on port 8000
-	# preseve newlines
 	curl -X POST --data-binary @kata.py -H "Content-Type: text/plain" http://home.lan:8000
-
 
 help:
 	@grep -hE '^[A-Za-z0-9_ \-]*?:.*##.*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
