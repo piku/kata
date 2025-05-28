@@ -75,7 +75,6 @@ RUN apt update \
 ENV VIRTUAL_ENV=/venv
 ENV PATH=/venv/bin:$PATH
 VOLUME ["/app", "/config", "/data", "/venv"]
-EXPOSE 8080
 WORKDIR /app
 CMD ['python', '-m', 'app']
 """
@@ -336,11 +335,9 @@ def parse_yaml(app_name, filename) -> tuple:
             continue
         if not "ports" in service:
             echo(f"Warning: service '{service_name}' in {filename} has no 'ports' specified", fg='yellow')
-            continue
-
         if not "environment" in service:
-            service["environment"] = {}
-        service["environment"].update(env)
+            service["environment"] = []
+        service["environment"].extend(env_dump)
 
     caddy_config = {}
     if "caddy" in data.keys():
