@@ -270,8 +270,8 @@ def parse_yaml(app_name, filename) -> tuple:
         env = data["environment"]
 
     env = base_env(app_name, env)
-    echo(f"Using environment for {app_name}: {env}", fg='green')
-
+    env_dump = [f"{k}={v}" for k, v in env.items()]
+    echo(f"Using environment for {app_name}: {",".join(env_dump)}", fg='green')
     if not "services" in data:
         echo(f"Warning: no 'services' section found in {filename}", fg='yellow')
     services = data.get("services", {})
@@ -347,6 +347,8 @@ def parse_yaml(app_name, filename) -> tuple:
                     "device": volumes[volume]
                 }
             }
+    if "environment" in data:
+        del data['environment']
     return (data, caddy_config)
 
 
@@ -644,20 +646,24 @@ def cmd_config_live(app):
     with safe_load(join(app_path, 'docker-compose.yaml')) as yaml:
         echo(safe_dump(yaml, stdout, default_flow_style=False, allow_unicode=True), fg='white')
 
+
 @command('config:caddy')
-@argument('app')
+@argument('app', required=False)
 def cmd_caddy_app(app):
     """Show Caddy configuration for an app, e.g.: kata config:caddy <app>"""
     app = exit_if_invalid(app)
 
     app_path = join(APP_ROOT, app)
-    caddy_json = load_caddy_json(app_path)
+    caddy_json = caddy_get(app)
 
-    if caddy_json:
+    if caddy_json and app:
         echo(f"Caddy configuration for app '{app}':", fg='green')
         echo(dumps(caddy_json, indent=2), fg='white')
+    elif caddy_json:
+        echo(f"Caddy configuration:", fg='green')
+        echo(dumps(caddy_json, indent=2), fg='white')
     else:
-        echo(f"No caddy.json configuration found for app '{app}'", fg='yellow')
+        echo(f"No Caddy configuration found", fg='yellow')
 
 
 @command('destroy')

@@ -8,7 +8,16 @@ Before installing Kata, ensure your Debian system has the following packages ins
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-pip python3-venv git curl uidmap openssh-server systemd-container podman podman-compose caddy
+sudo apt install -y \
+    python3 \
+    python3-pip python3-venv \
+    python3-yaml python3-click \
+    git curl openssh-server \
+    uidmap systemd-container \
+    podman podman-compose \
+    caddy \
+ sudo loginctl enable-linger kata
+ sudo machinectl shell --uid kata
 ```
 
 **Minimum Python Version:** Kata requires Python 3.10 or higher.
