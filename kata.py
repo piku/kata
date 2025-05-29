@@ -66,7 +66,6 @@ RUN apt update \
     python3-pip \
     python3-dev \
     python3-venv
-
 ENV VIRTUAL_ENV=/venv
 ENV PATH=/venv/bin:$PATH
 VOLUME ["/app", "/config", "/data", "/venv"]
@@ -74,8 +73,24 @@ WORKDIR /app
 CMD ['python', '-m', 'app']
 """
 
+NODEJS_DOCKERFILE = """
+FROM debian:trixie
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt update \
+ && apt dist-upgrade -y \
+ && apt-get -qq install \
+    nodejs
+ENV NODE_PATH=/venv
+ENV NPM_CONFIG_PREFIX=/venv
+ENV PATH=/venv/bin:/venv/.bin:$PATH
+VOLUME ["/app", "/config", "/data", "/venv"]
+WORKDIR /app
+CMD ['node', 'app.js']
+"""
+
 RUNTIME_IMAGES = {
     'kata/python': PYTHON_DOCKERFILE,
+    'kata/nodejs': NODEJS_DOCKERFILE
 }
 
 # === Utility functions ===
@@ -194,12 +209,17 @@ def docker_handle_runtime_environment(app_name, runtime, destroy=False, env=None
         cmds = {
             'python': [['rm', '-rf', '/venv/*'],
                        ['chown', '-hR', f'{PUID}:{PGID}', '/data'], 
+                       ['chown', '-hR', f'{PUID}:{PGID}', '/config']],
+            'nodejs': [['rm', '-rf', '/venv/*'],
+                       ['chown', '-hR', f'{PUID}:{PGID}', '/data'], 
                        ['chown', '-hR', f'{PUID}:{PGID}', '/config']]
         }
     else:
         cmds = {
             'python': [['python3', '-m', 'venv', '/venv'],
-                       ['pip3', 'install', '-r', '/app/requirements.txt']]
+                       ['pip3', 'install', '-r', '/app/requirements.txt']],
+            'nodejs': [['ln', '-s', '/venv', 'node_modules'],
+                       ['npm', 'install']]
         }
     for cmd in cmds[runtime]:
         call(['docker', 'run', '--rm'] + volumes + ['-i', f'kata/{runtime}'] + cmd,
