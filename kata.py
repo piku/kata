@@ -114,9 +114,9 @@ def base_env(app, env=None) -> dict:
     if env is not None:
         base.update(env)
 
-    # finally, an ENV or .env file in the app directory overrides things
+    # finally, an ENV or .env file in the config directory overrides things
     for name in ['ENV', '.env']:
-        env_file = join(APP_ROOT, app, name)
+        env_file = join(CONFIG_ROOT, app, name)
         if exists(env_file):
             with open(env_file, 'r', encoding='utf-8') as f:
                 base.update(dict(line.strip().split('=', 1) for line in f if '=' in line))
