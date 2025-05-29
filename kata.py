@@ -28,14 +28,13 @@ from tempfile import NamedTemporaryFile
 from time import sleep
 from traceback import format_exc
 
+
 # === Make sure we can access all system and user binaries ===
 
 if 'sbin' not in environ['PATH']:
     environ['PATH'] = "/usr/local/sbin:/usr/sbin:/sbin:" + environ['PATH']
 if '.local' not in environ['PATH']:
     environ['PATH'] = environ['HOME'] + "/.local/bin:" + environ['PATH']
-if KATA_BIN not in environ['PATH']:
-    environ['PATH'] = KATA_BIN + ":" + environ['PATH']
 
 # === Globals - all tweakable settings are here ===
 
@@ -49,13 +48,18 @@ CONFIG_ROOT = abspath(join(KATA_ROOT, "config"))
 GIT_ROOT = abspath(join(KATA_ROOT, "repos"))
 LOG_ROOT = abspath(join(KATA_ROOT, "logs"))
 ENV_ROOT = abspath(join(KATA_ROOT, "envs"))
-PUID = getuid()
-PGID = getgid()
 DOCKER_COMPOSE = ".docker-compose.yaml"
-KATA_COMPOSE = "kata-compose.yaml"
+
 ROOT_FOLDERS = ['APP_ROOT', 'DATA_ROOT', 'ENV_ROOT', 'CONFIG_ROOT', 'GIT_ROOT', 'LOG_ROOT']
 
+# Set XDG_RUNTIME_DIR if not set (needed for systemd --user)
+if 'XDG_RUNTIME_DIR' not in environ:
+    environ['XDG_RUNTIME_DIR'] = f"/run/user/{getuid()}"
+
 # === Make sure we can access kata user-installed binaries === #
+
+if KATA_BIN not in environ['PATH']:
+    environ['PATH'] = KATA_BIN + ":" + environ['PATH']
 
 PYTHON_DOCKERFILE = """
 FROM debian:trixie
@@ -70,24 +74,51 @@ RUN apt update \
 ENV VIRTUAL_ENV=/venv
 ENV PATH=/venv/bin:$PATH
 VOLUME ["/app", "/config", "/data", "/venv"]
-WORKDIR /app
-CMD ['python', '-m', 'app']
+EXPOSE 8080
+WORKDIR /appq
+CMD "python -m venv /venv && pip install -r requirements.txt"
 """
 
 RUNTIME_IMAGES = {
-    'kata/python': PYTHON_DOCKERFILE,
+    'python': PYTHON_DOCKERFILE,
 }
 
-# === Utility functions ===
+COMPOSE_TEMPLATE = """
+services:
+    {service_name}:
+        image: {image}
+        ports:
+        - "{port}:{port}"
+        environment:
+        - PORT={port}
+        volumes:
+        - app:/app
+        - data:/data
+        command: {command}
+volumes:
+    app:
+        driver: local
+        path: {app_path}
+    data:
+        driver: local
+        path: {data_path}
+"""
 
-def echo(message, fg=None, nl=True, err=False) -> None:
+# Helper functions for click
+def echo(message, fg=None, nl=True, err=False):
     """Print a message with optional color"""
     click_echo(message, color=True if fg else None, nl=nl, err=err)
 
+# === Utility functions ===
 
-def base_env(app, env=None) -> dict:
+def get_boolean(value):
+    """Convert a boolean-ish string to a boolean."""
+    return value.lower() in ['1', 'on', 'true', 'enabled', 'yes', 'y']
+
+def base_env(app, env=None):
     """Get the environment variables for an app"""
-    base = {'PGID': str(PGID), 'PUID': str(PUID)}
+
+    base = {}
     for key in ROOT_FOLDERS:
         try:
             path_value = globals()[key]
@@ -95,11 +126,13 @@ def base_env(app, env=None) -> dict:
         except KeyError:
             echo(f"Error: {key} not found in global variables", fg='red')
             exit(1)
+
     # If env is provided, update the base environment with it
     if env is not None:
         base.update(env)
 
     # finally, an ENV or .env file in the app directory overrides things
+
     for name in ['ENV', '.env']:
         env_file = join(APP_ROOT, app, name)
         if exists(env_file):
@@ -107,14 +140,13 @@ def base_env(app, env=None) -> dict:
                 base.update(dict(line.strip().split('=', 1) for line in f if '=' in line))
     return base
 
-
 def expandvars(buffer, env, default=None, skip_escaped=False):
     """expand shell-style environment variables in a buffer"""
     def replace_var(match):
         return env.get(match.group(2) or match.group(1), match.group(0) if default is None else default)
+
     pattern = (r'(?<!\\)' if skip_escaped else '') + r'\$(\w+|\{([^}]*)\})'
     return sub(pattern, replace_var, buffer)
-
 
 def load_yaml(filename, env=None):
     if not exists(filename):
@@ -131,6 +163,14 @@ def load_yaml(filename, env=None):
         echo(f"Error parsing YAML: {str(e)}", fg='red')
         return None
 
+def get_free_port(address=""):
+    """Find a free TCP port (entirely at random)"""
+    s = socket(AF_INET, SOCK_STREAM)
+    s.bind((address, 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
 # === SSH and git Helpers ===
 
 def setup_authorized_keys(ssh_fingerprint, script_path, pubkey):
@@ -144,7 +184,6 @@ def setup_authorized_keys(ssh_fingerprint, script_path, pubkey):
     chmod(dirname(authorized_keys), S_IRUSR | S_IWUSR | S_IXUSR)
     chmod(authorized_keys, S_IRUSR | S_IWUSR)
 
-
 def command_output(cmd):
     """executes a command and grabs its output, if any"""
     try:
@@ -157,11 +196,15 @@ def command_output(cmd):
 
 def docker_check_image_exists(image_name):
     """Check if a Docker image exists locally"""
-    output = check_output(['docker', 'image', 'list', '--format', '{{.Repository}}:{{.Tag}}'], stderr=STDOUT, universal_newlines=True)
-    if image_name in output:
+    try:
+        output = check_output(['docker', 'image', 'inspect', image_name], stderr=STDOUT, universal_newlines=True)
         return True
-    return False
-
+    except Exception as e:
+        if "No such image" in str(e):
+            return False
+        else:
+            echo(f"Error checking image: {str(e)}", fg='red')
+            return False
 
 def docker_create_runtime_image(image_name, dockerfile_content):
     """Create a Docker image from a Dockerfile content"""
@@ -169,57 +212,28 @@ def docker_create_runtime_image(image_name, dockerfile_content):
         with NamedTemporaryFile(delete=False, mode='w', suffix='.Dockerfile') as dockerfile:
             dockerfile.write(dockerfile_content)
             dockerfile_path = dockerfile.name
+
+        # Build the Docker image
         output = check_output(['docker', 'build', '-t', image_name, '-f', dockerfile_path, '.'], stderr=STDOUT, universal_newlines=True)
-        echo(f"Created '{image_name}' successfully.", fg='green')
+        echo(f"Created Docker image '{image_name}' successfully.", fg='green')
         return True
     except Exception as e:
-        echo(f"Error creating image: {str(e)}", fg='red')
+        echo(f"Error creating Docker image: {str(e)}", fg='red')
         return False
     finally:
         remove(dockerfile_path)
 
 
-def docker_handle_runtime_environment(app_name, runtime, destroy=False, env=None):
-    image = f"kata/{runtime}"
-    if not docker_check_image_exists(image):
-        if not docker_create_runtime_image(image, RUNTIME_IMAGES[image]):
-            exit(1)
+def docker_prepare_runtime_environment(app_name, runtime, env=None):
     volumes = [
         "-v", f"{join(APP_ROOT, app_name)}:/app",
         "-v", f"{join(CONFIG_ROOT, app_name)}:/config",
         "-v", f"{join(DATA_ROOT, app_name)}:/data",
         "-v", f"{join(ENV_ROOT, app_name)}:/venv"
     ]
-    if destroy:
-        cmds = {
-            'python': [['rm', '-rf', '/venv/*'],
-                       ['chown', '-hR', f'{PUID}:{PGID}', '/data'], 
-                       ['chown', '-hR', f'{PUID}:{PGID}', '/config']]
-        }
-    else:
-        cmds = {
-            'python': [['python3', '-m', 'venv', '/venv'],
-                       ['pip3', 'install', '-r', '/app/requirements.txt']]
-        }
-    for cmd in cmds[runtime]:
-        call(['docker', 'run', '--rm'] + volumes + ['-i', f'kata/{runtime}'] + cmd,
+    ### Mount the required volumes and run the docker image for the runtime environment
+    call(['docker', 'run'] + volumes + ['-ti', join("kata", runtime)],
          cwd=join(APP_ROOT, app_name), env=env, stdout=stdout, stderr=stderr, universal_newlines=True)
-
-
-def docker_cleanup_runtime_environment(app_name, runtime):
-    """Cleans up the Docker environment for an app"""
-    app_path = join(APP_ROOT, app_name)
-    if exists(app_path):
-        echo(f"Cleaning up Docker environment for '{app_name}'", fg='green')
-        # Remove the Docker volumes associated with the app
-        volumes = ['app', 'config', 'data', 'venv']
-        for volume in volumes:
-            volume_path = join(app_path, volume)
-            if exists(volume_path):
-                rmtree(volume_path, ignore_errors=True)
-                echo(f"Removed volume '{volume}' for app '{app_name}'", fg='green')
-    else:
-        echo(f"App '{app_name}' does not exist, skipping cleanup.", fg='yellow')
 
 # === App Management ===
 
@@ -231,7 +245,6 @@ def exit_if_invalid(app, deployed=False):
         echo(f"Error: app '{app}' not deployed!", fg='red')
         exit(1)
     return app
-
 
 def parse_settings(filename, env={}):
     """Parses a settings file and returns a dict with environment variables"""
@@ -250,8 +263,7 @@ def parse_settings(filename, env={}):
                 return {}
     return env
 
-
-def sanitize_app_name(app) -> str:
+def sanitize_app_name(app):
     """Sanitize the app name"""
     if app:
         return sub(r'[^a-zA-Z0-9_-]', '', app)
@@ -259,7 +271,8 @@ def sanitize_app_name(app) -> str:
 
 
 def parse_yaml(app_name, filename) -> tuple:
-    """Parses the kata-compose.yaml"""
+    """Parses the kata-compose.yaml file and returns a tuple of
+        (list[workers], docker-compose dict, caddy config dict)"""
 
     data = load_yaml(filename, base_env(app_name))
 
@@ -268,11 +281,10 @@ def parse_yaml(app_name, filename) -> tuple:
 
     env = {}
     if "environment" in data:
-        env = {k: str(v) for k, v in data["environment"].items()}
+        env = data["environment"]
 
     env = base_env(app_name, env)
     env_dump = [f"{k}={v}" for k, v in env.items()]
-
     echo(f"Using environment for {app_name}: {",".join(env_dump)}", fg='green')
     if not "services" in data:
         echo(f"Warning: no 'services' section found in {filename}", fg='yellow')
@@ -282,12 +294,15 @@ def parse_yaml(app_name, filename) -> tuple:
         if not "image" in service:
             echo(f"Warning: service '{service_name}' in {filename} has no 'image' specified", fg='yellow')
             if "runtime" in service:
-                service["image"] = f"kata/{service["runtime"]}"
-                if service["image"] in RUNTIME_IMAGES:
-                    docker_handle_runtime_environment(app_name, service["runtime"], env=env)
-                else:
-                    echo(f"Error: runtime '{service['runtime']}' not supported", fg='red')
-                    exit(1)
+                service["image"] = join("kata", service["runtime"])
+                if not docker_check_image_exists(join("kata", service["runtime"])):
+                    if service["runtime"] in RUNTIME_IMAGES:
+                        if docker_create_runtime_image(join("kata", service["runtime"]), RUNTIME_IMAGES[service["runtime"]]):
+                            service["image"] = join("kata",service["runtime"])
+                        docker_prepare_runtime_environment(app_name, service["runtime"], env)
+                    else:
+                        echo(f"Error: runtime '{service['runtime']}' not supported", fg='red')
+                        exit(1)
                 del service["runtime"]
             if not "volumes" in service:
                 echo(f"Warning: service '{service_name}' in {filename} has no 'volumes' specified", fg='yellow')
@@ -297,9 +312,11 @@ def parse_yaml(app_name, filename) -> tuple:
             continue
         if not "ports" in service:
             echo(f"Warning: service '{service_name}' in {filename} has no 'ports' specified", fg='yellow')
+            continue
+
         if not "environment" in service:
-            service["environment"] = []
-        service["environment"].extend(env_dump)
+            service["environment"] = {}
+        service["environment"].update(env)
 
     caddy_config = {}
     if "caddy" in data.keys():
@@ -332,6 +349,7 @@ def parse_yaml(app_name, filename) -> tuple:
         del data['environment']
     return (data, caddy_config)
 
+
 # Caddy API Management
 
 def validate_caddy_json(config):
@@ -355,7 +373,6 @@ def validate_caddy_json(config):
             if 'handler' not in handler:
                 return False, "Each handler must have a 'handler' field"
     return True, None
-
 
 def caddy_config(app, config_json):
     """Configure Caddy for an app using the admin API"""
@@ -413,7 +430,6 @@ def caddy_config(app, config_json):
     finally:
         pass
 
-
 def caddy_get(app=None):
     """Get Caddy configuration using the admin API"""
     try:
@@ -440,7 +456,6 @@ def caddy_get(app=None):
     except Exception as e:
         echo(f"Error getting Caddy configuration: {e}", fg='red')
         return None
-
 
 def caddy_remove(app):
     """Remove Caddy configuration for an app using the admin API"""
@@ -489,7 +504,7 @@ def do_deploy(app, deltas={}, newrev=None):
     """Deploy an app by resetting the work directory"""
 
     app_path = join(APP_ROOT, app)
-    compose_file = join(app_path, KATA_COMPOSE)
+    compose_file = join(app_path, 'kata-compose.yaml')
 
     env = {'GIT_WORK_DIR': app_path}
     if exists(app_path):
@@ -506,7 +521,6 @@ def do_deploy(app, deltas={}, newrev=None):
         do_start(app)
     else:
         echo(f"Error: app '{app}' not found.", fg='red')
-
 
 def do_start(app):
     app_path = join(APP_ROOT, app)
@@ -525,21 +539,12 @@ def do_stop(app):
         call(['docker', 'compose', '-f', join(app_path, DOCKER_COMPOSE), 'stop'],
              cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
 
-
 def do_remove(app):
     app_path = join(APP_ROOT, app)
     if exists(join(app_path, DOCKER_COMPOSE)):
         call(['docker', 'compose', '-f', join(app_path, DOCKER_COMPOSE),
               'down', '--rmi', 'all', '--volumes'],
              cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
-        yaml = safe_load(open(join(app_path, KATA_COMPOSE), 'r', encoding='utf-8').read())
-        if 'services' in yaml:
-            for service_name, service in yaml['services'].items():
-                echo("Removing service: " + service_name, fg='yellow')
-                if 'runtime' in service:
-                    runtime = service['runtime']
-                    docker_handle_runtime_environment(app, runtime, destroy=True)
-
 
 def do_restart(app):
     """Restarts a deployed app"""
@@ -549,13 +554,12 @@ def do_restart(app):
 
 # === CLI Commands ===
 
-command = cli.command
-
 @group(context_settings=dict(help_option_names=['-h', '--help']))
 def cli():
     """Kata: The other smallest PaaS you've ever seen"""
     pass
 
+command = cli.command
 
 @command('apps')
 def cmd_apps():
@@ -565,13 +569,9 @@ def cmd_apps():
         echo("There are no applications deployed.")
         return
 
-    containers = check_output(['docker', 'ps', '--format', '{{.Names}}'], universal_newlines=True).splitlines()
     for a in apps:
-        running = False
-        for c in containers:
-            if c.startswith(a + '-'):
-                running = True
-                break
+        units = glob(join(SYSTEMD_ROOT, f'{a}*.service'))
+        running = len(units) != 0
         echo(('*' if running else ' ') + a, fg='green')
 
 
@@ -581,7 +581,7 @@ def cmd_config(app):
     """Show config, e.g.: kata config <app>"""
     app = exit_if_invalid(app)
 
-    config_file = join(APP_ROOT, app, KATA_COMPOSE)
+    config_file = join(ENV_ROOT, app, 'ENV')
     if exists(config_file):
         echo(open(config_file).read().strip(), fg='white')
     else:
@@ -595,7 +595,7 @@ def cmd_config_get(app, setting):
     """Get a config setting, e.g.: kata config:get <app> KEY"""
     app = exit_if_invalid(app)
 
-    config_file = join(ENV_ROOT, app, '.env')
+    config_file = join(ENV_ROOT, app, 'ENV')
     if exists(config_file):
         env = parse_settings(config_file)
         if setting in env:
@@ -615,7 +615,7 @@ def cmd_config_set(app, settings):
     """Set config, e.g.: kata config:set <app> KEY=value"""
     app = exit_if_invalid(app)
 
-    config_file = join(ENV_ROOT, app, '.env')
+    config_file = join(ENV_ROOT, app, 'ENV')
     env = {}
     if exists(config_file):
         env = parse_settings(config_file)
@@ -639,15 +639,13 @@ def cmd_config_live(app):
     """Show live config for running app, e.g.: kata config:live <app>"""
     app = exit_if_invalid(app)
 
-    config_file = join(APP_ROOT, app, DOCKER_COMPOSE)
-    if exists(config_file):
-        echo(open(config_file).read().strip(), fg='white')
-    else:
-        echo(f"Warning: app '{app}' not deployed, no config found.", fg='yellow')
+    app_path = join(APP_ROOT, app)
+    echo(f"Docker configuration for app '{app}':", fg='green')
+    echo(open(join(app_path, DOCKER_COMPOSE), 'r', encoding='utf-8').read().strip(), fg='white')
 
 
 @command('config:caddy')
-@argument('app')
+@argument('app', required=False)
 def cmd_caddy_app(app):
     """Show Caddy configuration for an app, e.g.: kata config:caddy <app>"""
     app = exit_if_invalid(app)
@@ -655,17 +653,20 @@ def cmd_caddy_app(app):
     app_path = join(APP_ROOT, app)
     caddy_json = caddy_get(app)
 
-    if caddy_json:
+    if caddy_json and app:
+        echo(f"Caddy configuration for app '{app}':", fg='green')
+        echo(dumps(caddy_json, indent=2), fg='white')
+    elif caddy_json:
+        echo(f"Caddy configuration:", fg='green')
         echo(dumps(caddy_json, indent=2), fg='white')
     else:
-        echo(f"Warning: app '{app}' not deployed, no config found.", fg='yellow')
+        echo(f"No Caddy configuration found", fg='yellow')
 
 
 @command('destroy')
 @argument('app')
 @option('--force', '-f', is_flag=True, help='Force destruction without confirmation')
-@option('--wipe', '-w', is_flag=True, help='Delete data and config directories')
-def cmd_destroy(app, force, wipe):
+def cmd_destroy(app, force):
     """Destroy an app, e.g.: kata destroy <app>"""
     app = sanitize_app_name(app)
     app_path = join(APP_ROOT, app)
@@ -680,46 +681,50 @@ def cmd_destroy(app, force, wipe):
             echo("Aborted.", fg='yellow')
             return
 
-    caddy_remove(app)
+    # TODO: Remove Caddy configuration
     do_remove(app)
 
-    paths = [join(APP_ROOT, app), join(ENV_ROOT, app), join(LOG_ROOT, app), join(GIT_ROOT, app)]
-    if wipe:
-        paths.extend([join(DATA_ROOT, app), join(CONFIG_ROOT, app)])
-
-    for path in paths:
+    # Remove app directories
+    for path in [
+        join(APP_ROOT, app),
+        join(ENV_ROOT, app),
+        join(LOG_ROOT, app),
+        join(GIT_ROOT, app),
+        join(DATA_ROOT, app)
+    ]:
         if exists(path):
             try:
                 rmtree(path)
                 echo(f"Removed {path}", fg='green')
             except Exception as e:
                 echo(f"Error removing {path}: {str(e)}", fg='red')
+
     echo(f"App '{app}' destroyed", fg='green')
-    if not wipe:
-        echo("Data and config directories were not deleted. Use --wipe to remove them.", fg='yellow')
 
 
 @command('logs')
 @argument('app')
+@argument('service', required=False)
 @option('--follow', '-f', is_flag=True, help='Follow log output')
-@option('--service', '-s', 'service', help='Show logs for specific service(s)')
-def cmd_logs(app, follow, service):
-    """Show logs for an app, e.g.: kata logs <app>"""
+def cmd_logs(app, service, follow):
+    """Show logs for an app, e.g.: kata logs <app> [<service>]"""
     app = exit_if_invalid(app)
-    call(['docker', 'compose', '-f', join(APP_ROOT, app, DOCKER_COMPOSE), 'logs',
-          '{follow}'.format(follow='-f' if follow else ''),
-          '{service}'.format(service=service or '')],
-          stdout=stdout, stderr=stderr, universal_newlines=True)
 
+    cmd = ['docker', 'compose', '-f', join(APP_ROOT, app, DOCKER_COMPOSE), 'logs']
+    if follow:
+        cmd.append('-f')
+    if service:
+        cmd.append(service)
+    call(cmd, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 @command('ps')
 @argument('app', required=False)
 def cmd_ps(app):
     """List processes, e.g.: kata ps [<app>]"""
+
     app = exit_if_invalid(app)
     call(['docker', 'compose', '-f', join(APP_ROOT, app, DOCKER_COMPOSE), 'ps'],
          stdout=stdout, stderr=stderr, universal_newlines=True)
-
 
 @command('run')
 @argument('app')
@@ -728,9 +733,29 @@ def cmd_ps(app):
 def cmd_run(app, service, command):
     """Run a command in the app environment, e.g.: kata run <app> <command>"""
     app = exit_if_invalid(app)
+
     call(['docker', 'compose', '-f', join(APP_ROOT, app, DOCKER_COMPOSE), 'run', service] + list(command),
          stdout=stdout, stderr=stderr, universal_newlines=True)
 
+@command('parse')
+@argument('filename', type=Path(exists=True))
+def parse_file(filename):
+    """Parse a YAML file, e.g.: kata parse <filename>"""
+    echo(f"Parsing file: {filename}", fg='green')
+    try:
+        data, caddy = parse_yaml("sample", filename)
+        if data:
+            echo("Parsed data:", fg='green')
+            echo(safe_dump(data, default_flow_style=False), fg='white')
+        else:
+            echo("No valid data found in the file", fg='yellow')
+
+        if caddy:
+            echo("Parsed Caddy configuration:", fg='green')
+            echo(safe_dump(caddy, default_flow_style=False), fg='white')
+
+    except Exception as e:
+        echo(f"Error parsing file: {str(e)}", fg='red')
 
 @command('restart')
 @argument('app')
@@ -818,22 +843,26 @@ def cmd_update():
     except Exception as e:
         echo(f"Error updating kata: {str(e)}", fg='red')
 
-# === Internal commands ===
+# --- Internal commands ---
 
 @command("git-hook")
 @argument('app')
 def cmd_git_hook(app):
     # INTERNAL: Post-receive git hook
+
     app = sanitize_app_name(app)
     repo_path = join(GIT_ROOT, app)
     app_path = join(APP_ROOT, app)
     data_path = join(DATA_ROOT, app)
 
     for line in stdin:
+        # pylint: disable=unused-variable
         oldrev, newrev, refname = line.strip().split(" ")
+        # Handle pushes
         if not exists(app_path):
             echo("-----> Creating app '{}'".format(app), fg='green')
             makedirs(app_path)
+            # The data directory may already exist, since this may be a full redeployment (we never delete data since it may be expensive to recreate)
             if not exists(data_path):
                 makedirs(data_path)
             call("git clone --quiet {} {}".format(repo_path, app), cwd=APP_ROOT, shell=True)
@@ -844,6 +873,7 @@ def cmd_git_hook(app):
 @argument('app')
 def cmd_git_receive_pack(app):
     # INTERNAL: Handle git pushes for an app
+
     app = sanitize_app_name(app)
     hook_path = join(GIT_ROOT, app, 'hooks', 'post-receive')
     env = globals()
@@ -862,7 +892,6 @@ cat | KATA_ROOT="{KATA_ROOT:s}" {KATA_SCRIPT:s} git-hook {app:s}""".format(**env
     # Handle the actual receive. We'll be called with 'git-hook' after it happens
     call('git-shell -c "{}" '.format(argv[1] + " '{}'".format(app)), cwd=GIT_ROOT, shell=True)
 
-
 @command("git-upload-pack")
 @argument('app')
 def cmd_git_upload_pack(app):
@@ -873,19 +902,16 @@ def cmd_git_upload_pack(app):
     # Handle the actual receive. We'll be called with 'git-hook' after it happens
     call('git-shell -c "{}" '.format(argv[1] + " '{}'".format(app)), cwd=GIT_ROOT, shell=True)
 
-
 @command("scp")
 @argument('args', nargs=-1, required=True)
 def cmd_scp(args):
     """Simple wrapper to allow scp to work."""
     call(["scp"] + list(args), cwd=abspath(environ['HOME']))
 
-
 @command("help")
 def cmd_help():
     """display help for kata"""
     show_help()
-
 
 if __name__ == '__main__':
     # Run the CLI with all registered commands
