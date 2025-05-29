@@ -1,0 +1,24 @@
+environment:
+  PORT: 9080
+  BIND_ADDRESS: 0.0.0.0
+  RANGE: 10
+  INTERVAL: 1
+
+services:
+  main:
+    runtime: python
+    command: python3 main.py
+    network_mode: host
+    restart: always
+
+  worker:
+    runtime: python
+    command: python3 worker.py
+    network_mode: host
+    restart: always
+
+  clock:
+    runtime: python
+    command: python3 self_scheduled.py
+    network_mode: host
+    restart: always

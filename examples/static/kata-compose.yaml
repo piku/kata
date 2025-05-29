@@ -1,0 +1,15 @@
+environment:
+  PORT: 8080
+
+caddy:
+  listen:
+  - :$PORT
+  routes:
+  - handle:
+    - handler: file_server
+      index_names:
+      - index.html
+      - index.htm
+      root: $APP_ROOT/public
+  automatic_https:
+    disable: true
