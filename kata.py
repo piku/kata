@@ -597,9 +597,13 @@ def cmd_apps():
         echo("There are no applications deployed.")
         return
 
+    containers = check_output(['docker', 'ps', '--format', '{{.Names}}'], universal_newlines=True).splitlines()
     for a in apps:
-        units = glob(join(SYSTEMD_ROOT, f'{a}*.service'))
-        running = len(units) != 0
+        running = False
+        for c in containers:
+            if c.startswith(a + '-'):
+                running = True
+                break
         echo(('*' if running else ' ') + a, fg='green')
 
 
