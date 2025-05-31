@@ -34,8 +34,6 @@ if 'sbin' not in environ['PATH']:
     environ['PATH'] = "/usr/local/sbin:/usr/sbin:/sbin:" + environ['PATH']
 if '.local' not in environ['PATH']:
     environ['PATH'] = environ['HOME'] + "/.local/bin:" + environ['PATH']
-if KATA_BIN not in environ['PATH']:
-    environ['PATH'] = KATA_BIN + ":" + environ['PATH']
 
 # === Globals - all tweakable settings are here ===
 
@@ -54,6 +52,8 @@ PGID = getgid()
 DOCKER_COMPOSE = ".docker-compose.yaml"
 KATA_COMPOSE = "kata-compose.yaml"
 ROOT_FOLDERS = ['APP_ROOT', 'DATA_ROOT', 'ENV_ROOT', 'CONFIG_ROOT', 'GIT_ROOT', 'LOG_ROOT']
+if KATA_BIN not in environ['PATH']:
+    environ['PATH'] = KATA_BIN + ":" + environ['PATH']
 
 # === Make sure we can access kata user-installed binaries === #
 
@@ -196,7 +196,7 @@ def docker_create_runtime_image(image_name, dockerfile_content):
 
 def docker_handle_runtime_environment(app_name, runtime, destroy=False, env=None):
     image = f"kata/{runtime}"
-    if not docker_check_image_exists(image):
+    if not docker_check_image_exists(image) and not destroy:
         if not docker_create_runtime_image(image, RUNTIME_IMAGES[image]):
             exit(1)
     volumes = [
@@ -237,9 +237,9 @@ def docker_cleanup_runtime_environment(app_name, runtime):
             volume_path = join(app_path, volume)
             if exists(volume_path):
                 rmtree(volume_path, ignore_errors=True)
-                echo(f"Removed volume '{volume}' for app '{app_name}'", fg='green')
+        echo(f"Info: Removed volumes '{volumes}' for app '{app_name}'", fg='green')
     else:
-        echo(f"App '{app_name}' does not exist, skipping cleanup.", fg='yellow')
+        echo(f"Warning: App '{app_name}' does not exist, skipping cleanup.", fg='yellow')
 
 # === App Management ===
 
@@ -299,10 +299,11 @@ def parse_compose(app_name, filename) -> tuple:
     services = data.get("services", {})
 
     for service_name, service in services.items():
+        echo(f"-----> Preparing service '{service_name}'", fg='green')
         if not "image" in service:
-            echo(f"Warning: service '{service_name}' in {filename} has no 'image' specified", fg='yellow')
             if "runtime" in service:
                 service["image"] = f"kata/{service["runtime"]}"
+                echo(f"Info: service '{service_name}' will use runtime '{service['runtime']}'", fg='green')
                 if service["image"] in RUNTIME_IMAGES:
                     docker_handle_runtime_environment(app_name, service["runtime"], env=env)
                 else:
@@ -310,13 +311,13 @@ def parse_compose(app_name, filename) -> tuple:
                     exit(1)
                 del service["runtime"]
             if not "volumes" in service:
-                echo(f"Info: service '{service_name}' in {filename} has no 'volumes' specified, applying defaults", fg='green')
+                echo(f"Info: service '{service_name}' has no 'volumes' specified, applying defaults", fg='green')
                 service["volumes"] = ["app:/app", "config:/config", "data:/data", "venv:/venv"]
         if not "command" in service:
-            echo(f"Warning: service '{service_name}' in {filename} has no 'command' specified", fg='yellow')
+            echo(f"Warning: service '{service_name}' has no 'command' specified", fg='yellow')
             continue
         if not "ports" in service:
-            echo(f"Warning: service '{service_name}' in {filename} has no 'ports' specified", fg='yellow')
+            echo(f"Warning: service '{service_name}' has no 'ports' specified", fg='yellow')
         if not "environment" in service:
             service["environment"] = []
         service["environment"].extend(env_dump)
@@ -326,18 +327,17 @@ def parse_compose(app_name, filename) -> tuple:
         caddy_config = data.get("caddy", {})
         del data["caddy"]
     else:
-        echo(f"Warning: no 'caddy' section found in {filename}", fg='yellow')
+        echo(f"Warning: no 'caddy' section found, no HTTP/S handling done.", fg='yellow')
 
     if not "volumes" in data.keys():
+        echo(f"Info: applying default volume setup.", fg='green')
         volumes = {
             "app": join(APP_ROOT, app_name),
             "config": join(CONFIG_ROOT, app_name),
             "data": join(DATA_ROOT, app_name),
             "venv": join(ENV_ROOT, app_name)
         }
-        echo(f"Warning: no 'volumes' section found in {filename}, creating default", fg='yellow')
         for volume in ["app", "config", "data", "venv"]:
-            echo(f"Warning: no '{volume}' volume found in {filename}, creating default", fg='yellow')
             makedirs(volumes[volume], exist_ok=True)
             data["volumes"] = data.get("volumes", {})
             data["volumes"][volume] = {
@@ -348,6 +348,9 @@ def parse_compose(app_name, filename) -> tuple:
                     "device": volumes[volume]
                 }
             }
+    else:
+        echo(f"Warning: using app-specific volume setup.", fg='yellow')
+    
     if "environment" in data:
         del data['environment']
     return (data, caddy_config)
@@ -549,7 +552,7 @@ def do_remove(app):
     app_path = join(APP_ROOT, app)
     if exists(join(app_path, DOCKER_COMPOSE)):
         call(['docker', 'compose', '-f', join(app_path, DOCKER_COMPOSE),
-              'down', '--rmi', 'all', '--volumes'],
+              'down', '--rmi', 'local', '--volumes'],
              cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
         yaml = safe_load(open(join(app_path, KATA_COMPOSE), 'r', encoding='utf-8').read())
         if 'services' in yaml:
@@ -568,13 +571,12 @@ def do_restart(app):
 
 # === CLI Commands ===
 
-command = cli.command
-
 @group(context_settings=dict(help_option_names=['-h', '--help']))
 def cli():
     """Kata: The other smallest PaaS you've ever seen"""
     pass
 
+command = cli.command
 
 @command('apps')
 def cmd_apps():
