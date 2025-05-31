@@ -79,7 +79,9 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN apt update \
  && apt dist-upgrade -y \
  && apt-get -qq install \
-    nodejs
+    nodejs \
+    npm \
+    yarnpkg
 ENV NODE_PATH=/venv
 ENV NPM_CONFIG_PREFIX=/venv
 ENV PATH=/venv/bin:/venv/.bin:$PATH
@@ -207,19 +209,19 @@ def docker_handle_runtime_environment(app_name, runtime, destroy=False, env=None
     ]
     if destroy:
         cmds = {
-            'python': [['rm', '-rf', '/venv/*'],
-                       ['chown', '-hR', f'{PUID}:{PGID}', '/data'], 
+            'python': [['chown', '-hR', f'{PUID}:{PGID}', '/data'], 
+                       ['chown', '-hR', f'{PUID}:{PGID}', '/venv'], 
                        ['chown', '-hR', f'{PUID}:{PGID}', '/config']],
-            'nodejs': [['rm', '-rf', '/venv/*'],
-                       ['chown', '-hR', f'{PUID}:{PGID}', '/data'], 
+            'nodejs': [['chown', '-hR', f'{PUID}:{PGID}', '/data'], 
+                       ['chown', '-hR', f'{PUID}:{PGID}', '/app'], 
+                       ['chown', '-hR', f'{PUID}:{PGID}', '/venv'], 
                        ['chown', '-hR', f'{PUID}:{PGID}', '/config']]
         }
     else:
         cmds = {
             'python': [['python3', '-m', 'venv', '/venv'],
                        ['pip3', 'install', '-r', '/app/requirements.txt']],
-            'nodejs': [['ln', '-s', '/venv', 'node_modules'],
-                       ['npm', 'install']]
+            'nodejs': [['npm', 'install' ]]
         }
     for cmd in cmds[runtime]:
         call(['docker', 'run', '--rm'] + volumes + ['-i', f'kata/{runtime}'] + cmd,
@@ -284,7 +286,7 @@ def parse_compose(app_name, filename) -> tuple:
     data = load_yaml(filename, base_env(app_name))
 
     if not data:
-        return None
+        return None, None
 
     env = {}
     if "environment" in data:
@@ -421,8 +423,6 @@ def caddy_config(app, config_json):
 
         if resp.status in (200, 201, 204):
             echo(f"-----> Successfully configured Caddy for app '{app}'", fg='green')
-            echo(f"-----> Use 'kata caddy:app {app}' to view the configuration", fg='green')
-            echo("-----> Use 'kata caddy' to view the complete Caddy configuration", fg='green')
             return True
         else:
             echo(f"Warning: Caddy API configuration failed: {resp.status} {resp.reason}\n{body}", fg='yellow')
@@ -521,6 +521,9 @@ def do_deploy(app, deltas={}, newrev=None):
         call('git submodule init', cwd=app_path, env=env, shell=True)
         call('git submodule update', cwd=app_path, env=env, shell=True)
         compose, caddy = parse_compose(app, compose_file)
+        if not compose:
+            echo(f"Error: could not parse {compose_file}", fg='red')
+            return
         with open(join(APP_ROOT, app, DOCKER_COMPOSE), "w", encoding='utf-8') as f:
             f.write(safe_dump(compose))
         if caddy:
@@ -551,6 +554,7 @@ def do_stop(app):
 def do_remove(app):
     app_path = join(APP_ROOT, app)
     if exists(join(app_path, DOCKER_COMPOSE)):
+        echo(f"-----> Removing '{app}'", fg='yellow')
         call(['docker', 'compose', '-f', join(app_path, DOCKER_COMPOSE),
               'down', '--rmi', 'local', '--volumes'],
              cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
@@ -673,13 +677,12 @@ def cmd_caddy_app(app):
     """Show Caddy configuration for an app, e.g.: kata config:caddy <app>"""
     app = exit_if_invalid(app)
 
-    app_path = join(APP_ROOT, app)
     caddy_json = caddy_get(app)
 
     if caddy_json:
         echo(dumps(caddy_json, indent=2), fg='white')
     else:
-        echo(f"Warning: app '{app}' not deployed, no config found.", fg='yellow')
+        echo(f"Warning: app '{app}' has no Caddy config.", fg='yellow')
 
 
 @command('destroy')
@@ -712,10 +715,9 @@ def cmd_destroy(app, force, wipe):
         if exists(path):
             try:
                 rmtree(path)
-                echo(f"Removed {path}", fg='green')
             except Exception as e:
                 echo(f"Error removing {path}: {str(e)}", fg='red')
-    echo(f"App '{app}' destroyed", fg='green')
+    echo(f"Info: App '{app}' destroyed", fg='green')
     if not wipe:
         echo("Data and config directories were not deleted. Use --wipe to remove them.", fg='yellow')
 
@@ -723,14 +725,16 @@ def cmd_destroy(app, force, wipe):
 @command('logs')
 @argument('app')
 @option('--follow', '-f', is_flag=True, help='Follow log output')
-@option('--service', '-s', 'service', help='Show logs for specific service(s)')
-def cmd_logs(app, follow, service):
-    """Show logs for an app, e.g.: kata logs <app>"""
+def cmd_logs(app, follow):
+    """Show logs for an app, e.g.: kata logs <app> [service1] [service2]..."""
     app = exit_if_invalid(app)
-    call(['docker', 'compose', '-f', join(APP_ROOT, app, DOCKER_COMPOSE), 'logs',
-          '{follow}'.format(follow='-f' if follow else ''),
-          '{service}'.format(service=service or '')],
-          stdout=stdout, stderr=stderr, universal_newlines=True)
+    
+    cmd = ['docker', 'compose', '-f', join(APP_ROOT, app, DOCKER_COMPOSE), 'logs']
+    
+    if follow:
+        cmd.append('-f')
+        
+    call(cmd, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
 @command('ps')
