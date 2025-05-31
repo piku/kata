@@ -58,7 +58,7 @@ ROOT_FOLDERS = ['APP_ROOT', 'DATA_ROOT', 'ENV_ROOT', 'CONFIG_ROOT', 'GIT_ROOT', 
 # === Make sure we can access kata user-installed binaries === #
 
 PYTHON_DOCKERFILE = """
-FROM debian:trixie
+FROM debian:trixie-slim
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt update \
  && apt dist-upgrade -y \
@@ -74,7 +74,7 @@ CMD ['python', '-m', 'app']
 """
 
 NODEJS_DOCKERFILE = """
-FROM debian:trixie
+FROM debian:trixie-slim
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt update \
  && apt dist-upgrade -y \
@@ -278,7 +278,7 @@ def sanitize_app_name(app) -> str:
     return app
 
 
-def parse_yaml(app_name, filename) -> tuple:
+def parse_compose(app_name, filename) -> tuple:
     """Parses the kata-compose.yaml"""
 
     data = load_yaml(filename, base_env(app_name))
@@ -310,7 +310,7 @@ def parse_yaml(app_name, filename) -> tuple:
                     exit(1)
                 del service["runtime"]
             if not "volumes" in service:
-                echo(f"Warning: service '{service_name}' in {filename} has no 'volumes' specified", fg='yellow')
+                echo(f"Info: service '{service_name}' in {filename} has no 'volumes' specified, applying defaults", fg='green')
                 service["volumes"] = ["app:/app", "config:/config", "data:/data", "venv:/venv"]
         if not "command" in service:
             echo(f"Warning: service '{service_name}' in {filename} has no 'command' specified", fg='yellow')
@@ -362,11 +362,9 @@ def validate_caddy_json(config):
 
     if 'routes' in config and not isinstance(config['routes'], list):
         return False, "'routes' must be an array of route objects"
-
     # Check for common missing fields
     if 'routes' not in config and 'handle' not in config:
         return False, "Missing required 'routes' or 'handle' field"
-
     # Check for common handler errors
     if 'handle' in config and isinstance(config['handle'], list):
         for handler in config['handle']:
@@ -519,10 +517,11 @@ def do_deploy(app, deltas={}, newrev=None):
             call(f'git reset --hard {newrev}', cwd=app_path, env=env, shell=True)
         call('git submodule init', cwd=app_path, env=env, shell=True)
         call('git submodule update', cwd=app_path, env=env, shell=True)
-        compose, caddy = parse_yaml(app, compose_file)
+        compose, caddy = parse_compose(app, compose_file)
         with open(join(APP_ROOT, app, DOCKER_COMPOSE), "w", encoding='utf-8') as f:
             f.write(safe_dump(compose))
-        caddy_config(app, caddy)
+        if caddy:
+            caddy_config(app, caddy)
         do_start(app)
     else:
         echo(f"Error: app '{app}' not found.", fg='red')
