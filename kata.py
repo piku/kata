@@ -22,7 +22,7 @@ from shlex import split as shsplit
 from shutil import copyfile, rmtree, which
 from socket import socket, AF_INET, SOCK_STREAM
 from stat import S_IRUSR, S_IWUSR, S_IXUSR
-from subprocess import call, check_output, Popen, STDOUT
+from subprocess import call, check_output, Popen, STDOUT, run
 from sys import argv, stdin, stdout, stderr, version_info, exit, path as sys_path
 from tempfile import NamedTemporaryFile
 from time import sleep
@@ -538,7 +538,7 @@ def do_start(app):
     if exists(join(app_path, DOCKER_COMPOSE)):
         echo(f"Starting app '{app}'", fg='yellow')
         # Stop the app using docker-compose
-        call(['docker', 'compose', '-f', join(app_path, DOCKER_COMPOSE), 'up', '-d'],
+        call(['docker', 'stack', 'deploy', app, f'--compose-file={join(app_path, DOCKER_COMPOSE)}'],
              cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
@@ -547,7 +547,7 @@ def do_stop(app):
     if exists(join(app_path, DOCKER_COMPOSE)):
         echo(f"Stopping app '{app}'", fg='yellow')
         # Stop the app using docker-compose
-        call(['docker', 'compose', '-f', join(app_path, DOCKER_COMPOSE), 'stop'],
+        call(['docker', 'stack', 'rm', app],
              cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
@@ -555,8 +555,7 @@ def do_remove(app):
     app_path = join(APP_ROOT, app)
     if exists(join(app_path, DOCKER_COMPOSE)):
         echo(f"-----> Removing '{app}'", fg='yellow')
-        call(['docker', 'compose', '-f', join(app_path, DOCKER_COMPOSE),
-              'down', '--rmi', 'local', '--volumes'],
+        call(['docker', 'stack', 'rm', app],
              cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
         yaml = safe_load(open(join(app_path, KATA_COMPOSE), 'r', encoding='utf-8').read())
         if 'services' in yaml:
@@ -658,6 +657,34 @@ def cmd_config_set(app, settings):
     do_deploy(app)
 
 
+@command('secrets:set')
+@argument('secrets', nargs=-1, required=True)
+def cmd_secrets_set(secrets):
+    """Define docker secrets: name=value"""
+    for s in secrets:
+        try:
+            k, v = s.split('=', 1)
+            echo(f"Setting {k}", fg='white')
+            run(['docker', 'secret', 'create', k, '-'], input=v,
+                 stdout=stdout, stderr=stderr, universal_newlines=True)
+        except Exception as e:
+            echo(f"Error {e} for secret '{k}'", fg='red')
+            continue
+
+
+@command('secrets:rm')
+@argument('secret', required=True)
+def cmd_secrets_rm(secret):
+    """Define docker secrets: name=value"""
+    call(['docker', 'secret', 'rm', secret], stdout=stdout, stderr=stderr, universal_newlines=True)
+
+
+@command('secrets:ls')
+def cmd_secrets_ls():
+    """List docker secrets defined in host."""
+    call(['docker', 'secret', 'ls'], stdout=stdout, stderr=stderr, universal_newlines=True)
+
+
 @command('config:docker')
 @argument('app')
 def cmd_config_live(app):
@@ -717,32 +744,42 @@ def cmd_destroy(app, force, wipe):
                 rmtree(path)
             except Exception as e:
                 echo(f"Error removing {path}: {str(e)}", fg='red')
-    echo(f"Info: App '{app}' destroyed", fg='green')
+    echo(f"-----> '{app}' destroyed", fg='green')
     if not wipe:
         echo("Data and config directories were not deleted. Use --wipe to remove them.", fg='yellow')
 
+# docker stack services rss2mastodon --format {{.Name}}
+# docker service logs foo
 
 @command('logs')
-@argument('app')
+@argument('service', nargs=-1, required=True)
 @option('--follow', '-f', is_flag=True, help='Follow log output')
-def cmd_logs(app, follow):
-    """Show logs for an app, e.g.: kata logs <app> [service1] [service2]..."""
-    app = exit_if_invalid(app)
+@option('--timestamps', '-t', is_flag=True, help='Timestamps')
+def cmd_logs(service, follow, timestamps):
+    """Show logs for a service, e.g.: kata logs service..."""
     
-    cmd = ['docker', 'compose', '-f', join(APP_ROOT, app, DOCKER_COMPOSE), 'logs']
-    
+    cmd = ['docker', 'service', 'logs', '-t', service]
     if follow:
         cmd.append('-f')
-        
+    if timestamps:
+        cmd.append('-t')
     call(cmd, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
+@command('services')
+@argument('app', required=True)
+def cmd_services(app):
+    """List services for an app"""
+    call(['docker', 'stack', 'services', app],
+         stdout=stdout, stderr=stderr, universal_newlines=True)
+
+
 @command('ps')
-@argument('app', required=False)
-def cmd_ps(app):
+@argument('service', nargs=-1, required=True)
+def cmd_ps(service):
     """List processes, e.g.: kata ps [<app>]"""
     app = exit_if_invalid(app)
-    call(['docker', 'compose', '-f', join(APP_ROOT, app, DOCKER_COMPOSE), 'ps'],
+    call(['docker', 'service', 'ps', service],
          stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
@@ -753,7 +790,7 @@ def cmd_ps(app):
 def cmd_run(app, service, command):
     """Run a command in the app environment, e.g.: kata run <app> <command>"""
     app = exit_if_invalid(app)
-    call(['docker', 'compose', '-f', join(APP_ROOT, app, DOCKER_COMPOSE), 'run', service] + list(command),
+    call(['docker', 'stack', '-f', join(APP_ROOT, app, DOCKER_COMPOSE), 'run', service] + list(command),
          stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
@@ -784,33 +821,30 @@ def cmd_setup():
     echo("Kata setup complete", fg='green')
 
 
-@command('setup:ssh')
-@argument('pubkey', required=False)
-def cmd_setup_ssh(pubkey):
-    """Setup SSH keys, e.g.: kata setup:ssh [pubkey]"""
-    if not pubkey:
-        # Look for an existing public key
-        default_key = join(environ['HOME'], '.ssh', 'id_rsa.pub')
-        if exists(default_key):
-            with open(default_key, 'r', encoding='utf-8') as f:
-                pubkey = f.read().strip()
+@command("setup:ssh")
+@argument('public_key_file')
+def cmd_setup_ssh(public_key_file):
+    """Set up a new SSH key (use - for stdin)"""
+
+    def add_helper(key_file):
+        if exists(key_file):
+            try:
+                fingerprint = str(check_output('ssh-keygen -lf ' + key_file, shell=True)).split(' ', 4)[1]
+                key = open(key_file, 'r').read().strip()
+                echo("Adding key '{}'.".format(fingerprint), fg='white')
+                setup_authorized_keys(fingerprint, KATA_SCRIPT, key)
+            except Exception:
+                echo("Error: invalid public key file '{}': {}".format(key_file, format_exc()), fg='red')
+        elif public_key_file == '-':
+            buffer = "".join(stdin.readlines())
+            with NamedTemporaryFile(mode="w") as f:
+                f.write(buffer)
+                f.flush()
+                add_helper(f.name)
         else:
-            echo("No public key provided and no default key found", fg='red')
-            echo("Generate one with: ssh-keygen -t rsa", fg='yellow')
-            return
-    try:
-        fingerprint = check_output(['ssh-keygen', '-lf', '-'],
-                                  input=pubkey.encode('utf-8'),
-                                  stderr=STDOUT,
-                                  universal_newlines=True).split()[1]
-    except Exception as e:
-        echo(f"Invalid public key format ({str(e)})", fg='red')
-        return
-    try:
-        setup_authorized_keys(fingerprint, KATA_SCRIPT, pubkey)
-        echo("SSH key setup complete", fg='green')
-    except Exception as e:
-        echo(f"Error setting up SSH keys: {str(e)}", fg='red')
+            echo("Error: public key file '{}' not found.".format(key_file), fg='red')
+
+    add_helper(public_key_file)
 
 
 @command('update')
