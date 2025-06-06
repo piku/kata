@@ -583,7 +583,7 @@ command = cli.command
 
 @command('apps')
 def cmd_apps():
-    """List apps, e.g.: kata apps"""
+    """List apps/stacks"""
     apps = listdir(APP_ROOT)
     if not apps:
         echo("There are no applications deployed.")
@@ -602,7 +602,7 @@ def cmd_apps():
 @command('config')
 @argument('app')
 def cmd_config(app):
-    """Show config, e.g.: kata config <app>"""
+    """Show configuration for an app"""
     app = exit_if_invalid(app)
 
     config_file = join(APP_ROOT, app, KATA_COMPOSE)
@@ -675,7 +675,7 @@ def cmd_secrets_set(secrets):
 @command('secrets:rm')
 @argument('secret', required=True)
 def cmd_secrets_rm(secret):
-    """Define docker secrets: name=value"""
+    """Remove a secret"""
     call(['docker', 'secret', 'rm', secret], stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
@@ -712,17 +712,17 @@ def cmd_caddy_app(app):
         echo(f"Warning: app '{app}' has no Caddy config.", fg='yellow')
 
 
-@command('destroy')
+@command('rm')
 @argument('app')
 @option('--force', '-f', is_flag=True, help='Force destruction without confirmation')
-@option('--wipe', '-w', is_flag=True, help='Delete data and config directories')
+@option('--wipe',  '-w', is_flag=True, help='Delete data and config directories')
 def cmd_destroy(app, force, wipe):
-    """Destroy an app, e.g.: kata destroy <app>"""
+    """Remove an app"""
     app = sanitize_app_name(app)
     app_path = join(APP_ROOT, app)
 
     if not exists(app_path):
-        echo(f"Error: app '{app}' not deployed!", fg='red')
+        echo(f"Error: stack '{app}' not deployed!", fg='red')
         return
 
     if not force:
@@ -756,9 +756,8 @@ def cmd_destroy(app, force, wipe):
 @option('--follow', '-f', is_flag=True, help='Follow log output')
 @option('--timestamps', '-t', is_flag=True, help='Timestamps')
 def cmd_logs(service, follow, timestamps):
-    """Show logs for a service, e.g.: kata logs service..."""
-    
-    cmd = ['docker', 'service', 'logs', '-t', service]
+    """Show logs for a service"""
+    cmd = ['docker', 'service', 'logs', service]
     if follow:
         cmd.append('-f')
     if timestamps:
@@ -767,37 +766,35 @@ def cmd_logs(service, follow, timestamps):
 
 
 @command('services')
-@argument('app', required=True)
-def cmd_services(app):
-    """List services for an app"""
-    call(['docker', 'stack', 'services', app],
+@argument('stack', required=True)
+def cmd_services(stack):
+    """List services for a stack"""
+    call(['docker', 'stack', 'services', stack],
          stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
 @command('ps')
 @argument('service', nargs=-1, required=True)
 def cmd_ps(service):
-    """List processes, e.g.: kata ps [<app>]"""
-    app = exit_if_invalid(app)
+    """List processes for a service"""
     call(['docker', 'service', 'ps', service],
          stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
 @command('run')
-@argument('app')
 @argument('service', required=True)
 @argument('command', nargs=-1, required=True)
-def cmd_run(app, service, command):
-    """Run a command in the app environment, e.g.: kata run <app> <command>"""
+def cmd_run(service, command):
+    """Run a command inside a service"""
     app = exit_if_invalid(app)
-    call(['docker', 'stack', '-f', join(APP_ROOT, app, DOCKER_COMPOSE), 'run', service] + list(command),
+    call(['docker', 'exec', '-ti', service] + list(command),
          stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
 @command('restart')
 @argument('app')
 def cmd_restart(app):
-    """Restart an app, e.g.: kata restart <app>"""
+    """Restart an app"""
     app = exit_if_invalid(app)
     do_restart(app)
 
@@ -805,14 +802,14 @@ def cmd_restart(app):
 @command('stop')
 @argument('app')
 def cmd_stop(app):
-    """Stop an app, e.g.: kata stop <app>"""
+    """Stop an app"""
     app = exit_if_invalid(app)
     do_stop(app)
 
 
 @command('setup')
 def cmd_setup():
-    """Setup kata environment, e.g.: kata setup"""
+    """Setup the local kata environment"""
     for f in ROOT_FOLDERS:
         d = globals()[f]
         if not exists(d):
@@ -825,7 +822,6 @@ def cmd_setup():
 @argument('public_key_file')
 def cmd_setup_ssh(public_key_file):
     """Set up a new SSH key (use - for stdin)"""
-
     def add_helper(key_file):
         if exists(key_file):
             try:
@@ -879,7 +875,7 @@ def cmd_update():
 
 # === Internal commands ===
 
-@command("git-hook")
+@command("git-hook", hidden=True)
 @argument('app')
 def cmd_git_hook(app):
     # INTERNAL: Post-receive git hook
@@ -899,7 +895,7 @@ def cmd_git_hook(app):
         do_deploy(app, newrev=newrev)
 
 
-@command("git-receive-pack")
+@command("git-receive-pack", hidden=True)
 @argument('app')
 def cmd_git_receive_pack(app):
     # INTERNAL: Handle git pushes for an app
@@ -922,7 +918,7 @@ cat | KATA_ROOT="{KATA_ROOT:s}" {KATA_SCRIPT:s} git-hook {app:s}""".format(**env
     call('git-shell -c "{}" '.format(argv[1] + " '{}'".format(app)), cwd=GIT_ROOT, shell=True)
 
 
-@command("git-upload-pack")
+@command("git-upload-pack", hidden=True)
 @argument('app')
 def cmd_git_upload_pack(app):
     # INTERNAL: Handle git upload pack for an app
