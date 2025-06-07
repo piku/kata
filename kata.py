@@ -8,7 +8,7 @@ try:
 except AssertionError:
     exit("Kata requires Python 3.12 or above")
 
-from click import argument, Path, echo as click_echo, group, option
+from click import argument, Path, echo as click_echo, group, option, UNPROCESSED
 from yaml import safe_load, safe_dump
 from collections import deque
 from fcntl import fcntl, F_SETFL, F_GETFL
@@ -599,7 +599,7 @@ def cmd_apps():
         echo(('*' if running else ' ') + a, fg='green')
 
 
-@command('config')
+@command('config:stack')
 @argument('app')
 def cmd_config(app):
     """Show configuration for an app"""
@@ -616,7 +616,7 @@ def cmd_config(app):
 @argument('app')
 @argument('setting')
 def cmd_config_get(app, setting):
-    """Get a config setting, e.g.: kata config:get <app> KEY"""
+    """Get a config setting"""
     app = exit_if_invalid(app)
 
     config_file = join(ENV_ROOT, app, '.env')
@@ -636,7 +636,7 @@ def cmd_config_get(app, setting):
 @argument('app')
 @argument('settings', nargs=-1, required=True)
 def cmd_config_set(app, settings):
-    """Set config, e.g.: kata config:set <app> KEY=value"""
+    """Set a config setting"""
     app = exit_if_invalid(app)
 
     config_file = join(ENV_ROOT, app, '.env')
@@ -660,7 +660,7 @@ def cmd_config_set(app, settings):
 @command('secrets:set')
 @argument('secrets', nargs=-1, required=True)
 def cmd_secrets_set(secrets):
-    """Define docker secrets: name=value"""
+    """Set a docker secret: name=value"""
     for s in secrets:
         try:
             k, v = s.split('=', 1)
@@ -688,9 +688,8 @@ def cmd_secrets_ls():
 @command('config:docker')
 @argument('app')
 def cmd_config_live(app):
-    """Show live config for running app, e.g.: kata config:live <app>"""
+    """Show live config for running app"""
     app = exit_if_invalid(app)
-
     config_file = join(APP_ROOT, app, DOCKER_COMPOSE)
     if exists(config_file):
         echo(open(config_file).read().strip(), fg='white')
@@ -701,11 +700,9 @@ def cmd_config_live(app):
 @command('config:caddy')
 @argument('app')
 def cmd_caddy_app(app):
-    """Show Caddy configuration for an app, e.g.: kata config:caddy <app>"""
+    """Show Caddy configuration for an app"""
     app = exit_if_invalid(app)
-
     caddy_json = caddy_get(app)
-
     if caddy_json:
         echo(dumps(caddy_json, indent=2), fg='white')
     else:
@@ -720,7 +717,6 @@ def cmd_destroy(app, force, wipe):
     """Remove an app"""
     app = sanitize_app_name(app)
     app_path = join(APP_ROOT, app)
-
     if not exists(app_path):
         echo(f"Error: stack '{app}' not deployed!", fg='red')
         return
@@ -755,14 +751,26 @@ def cmd_destroy(app, force, wipe):
 @argument('service', nargs=-1, required=True)
 @option('--follow', '-f', is_flag=True, help='Follow log output')
 @option('--timestamps', '-t', is_flag=True, help='Timestamps')
-def cmd_logs(service, follow, timestamps):
+@option('--clean', '-c', is_flag=True, help='Clean log output')
+def cmd_logs(service, follow, timestamps, clean):
     """Show logs for a service"""
     cmd = ['docker', 'service', 'logs', service]
     if follow:
         cmd.append('-f')
     if timestamps:
         cmd.append('-t')
+    if clean:
+        cmd.extend(['|', 'sed', "'s/^[^|]*|\s*//'"])
+
     call(cmd, stdout=stdout, stderr=stderr, universal_newlines=True)
+
+
+@command('docker', add_help_option=False, context_settings=dict(ignore_unknown_options=True))
+@argument('args', nargs=-1, required=True, type=UNPROCESSED)
+def cmd_ps(args):
+    """List processes for a service"""
+    call(['docker'] + list(args),
+         stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
 @command('services')
@@ -845,7 +853,7 @@ def cmd_setup_ssh(public_key_file):
 
 @command('update')
 def cmd_update():
-    """Update kata to the latest version, e.g.: kata update"""
+    """Update kata to the latest version"""
     try:
         # Download the latest version
         echo("Downloading latest version...", fg='green')
@@ -856,14 +864,11 @@ def cmd_update():
             backup_file = f"{KATA_SCRIPT}.backup"
             copyfile(KATA_SCRIPT, backup_file)
             echo(f"Created backup at {backup_file}", fg='green')
-
             # Write the new version
             with open(KATA_SCRIPT, 'w', encoding='utf-8') as f:
                 f.write(response.text)
-
             # Make it executable
             chmod(KATA_SCRIPT, S_IRUSR | S_IWUSR | S_IXUSR)
-
             echo("Update complete! Restart any running kata processes.", fg='green')
         else:
             echo(f"Failed to download update: HTTP {response.status_code}", fg='red')
@@ -929,16 +934,16 @@ def cmd_git_upload_pack(app):
     call('git-shell -c "{}" '.format(argv[1] + " '{}'".format(app)), cwd=GIT_ROOT, shell=True)
 
 
-@command("scp")
-@argument('args', nargs=-1, required=True)
+@command("scp", context_settings=dict(ignore_unknown_options=True))
+@argument('args', nargs=-1, required=True, type=UNPROCESSED)
 def cmd_scp(args):
-    """Simple wrapper to allow scp to work."""
+    """Copy files to/from the server"""
     call(["scp"] + list(args), cwd=abspath(environ['HOME']))
 
 
 @command("help")
 def cmd_help():
-    """display help for kata"""
+    """Display help"""
     show_help()
 
 
