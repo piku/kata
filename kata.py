@@ -8,7 +8,7 @@ try:
 except AssertionError:
     exit("Kata requires Python 3.12 or above")
 
-from click import argument, Path, echo as click_echo, group, option
+from click import argument, Path, echo as click_echo, group, option, UNPROCESSED
 from yaml import safe_load, safe_dump
 from collections import deque
 from fcntl import fcntl, F_SETFL, F_GETFL
@@ -22,7 +22,7 @@ from shlex import split as shsplit
 from shutil import copyfile, rmtree, which
 from socket import socket, AF_INET, SOCK_STREAM
 from stat import S_IRUSR, S_IWUSR, S_IXUSR
-from subprocess import call, check_output, Popen, STDOUT
+from subprocess import call, check_output, Popen, STDOUT, run
 from sys import argv, stdin, stdout, stderr, version_info, exit, path as sys_path
 from tempfile import NamedTemporaryFile
 from time import sleep
@@ -117,6 +117,7 @@ def base_env(app, env=None) -> dict:
         base.update(env)
 
     # finally, an ENV or .env file in the config directory overrides things
+    # TODO: validate if this still makes sense
     for name in ['ENV', '.env']:
         env_file = join(CONFIG_ROOT, app, name)
         if exists(env_file):
@@ -160,15 +161,6 @@ def setup_authorized_keys(ssh_fingerprint, script_path, pubkey):
         h.write(f"""command="FINGERPRINT={ssh_fingerprint:s} NAME=default {script_path:s} $SSH_ORIGINAL_COMMAND",no-agent-forwarding,no-user-rc,no-X11-forwarding,no-port-forwarding {pubkey:s}\n""")
     chmod(dirname(authorized_keys), S_IRUSR | S_IWUSR | S_IXUSR)
     chmod(authorized_keys, S_IRUSR | S_IWUSR)
-
-
-def command_output(cmd):
-    """executes a command and grabs its output, if any"""
-    try:
-        env = environ
-        return check_output(cmd, env=env, shell=True, universal_newlines=True)
-    except Exception as e:
-        return str(e)
 
 # === Docker Helpers ===
 
@@ -227,22 +219,6 @@ def docker_handle_runtime_environment(app_name, runtime, destroy=False, env=None
         call(['docker', 'run', '--rm'] + volumes + ['-i', f'kata/{runtime}'] + cmd,
          cwd=join(APP_ROOT, app_name), env=env, stdout=stdout, stderr=stderr, universal_newlines=True)
 
-
-def docker_cleanup_runtime_environment(app_name, runtime):
-    """Cleans up the Docker environment for an app"""
-    app_path = join(APP_ROOT, app_name)
-    if exists(app_path):
-        echo(f"Cleaning up Docker environment for '{app_name}'", fg='green')
-        # Remove the Docker volumes associated with the app
-        volumes = ['app', 'config', 'data', 'venv']
-        for volume in volumes:
-            volume_path = join(app_path, volume)
-            if exists(volume_path):
-                rmtree(volume_path, ignore_errors=True)
-        echo(f"Info: Removed volumes '{volumes}' for app '{app_name}'", fg='green')
-    else:
-        echo(f"Warning: App '{app_name}' does not exist, skipping cleanup.", fg='yellow')
-
 # === App Management ===
 
 def exit_if_invalid(app, deployed=False):
@@ -253,24 +229,6 @@ def exit_if_invalid(app, deployed=False):
         echo(f"Error: app '{app}' not deployed!", fg='red')
         exit(1)
     return app
-
-
-def parse_settings(filename, env={}):
-    """Parses a settings file and returns a dict with environment variables"""
-    if not exists(filename):
-        return {}
-
-    with open(filename, 'r') as settings:
-        for line in settings:
-            if line[0] == '#' or len(line.strip()) == 0:  # ignore comments and newlines
-                continue
-            try:
-                k, v = map(lambda x: x.strip(), line.split("=", 1))
-                env[k] = expandvars(v, env)
-            except Exception as e:
-                echo(f"Error: malformed setting '{line}', ignoring file: {e}", fg='red')
-                return {}
-    return env
 
 
 def sanitize_app_name(app) -> str:
@@ -538,7 +496,7 @@ def do_start(app):
     if exists(join(app_path, DOCKER_COMPOSE)):
         echo(f"Starting app '{app}'", fg='yellow')
         # Stop the app using docker-compose
-        call(['docker', 'compose', '-f', join(app_path, DOCKER_COMPOSE), 'up', '-d'],
+        call(['docker', 'stack', 'deploy', app, f'--compose-file={join(app_path, DOCKER_COMPOSE)}'],
              cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
@@ -547,7 +505,7 @@ def do_stop(app):
     if exists(join(app_path, DOCKER_COMPOSE)):
         echo(f"Stopping app '{app}'", fg='yellow')
         # Stop the app using docker-compose
-        call(['docker', 'compose', '-f', join(app_path, DOCKER_COMPOSE), 'stop'],
+        call(['docker', 'stack', 'rm', app],
              cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
@@ -555,8 +513,7 @@ def do_remove(app):
     app_path = join(APP_ROOT, app)
     if exists(join(app_path, DOCKER_COMPOSE)):
         echo(f"-----> Removing '{app}'", fg='yellow')
-        call(['docker', 'compose', '-f', join(app_path, DOCKER_COMPOSE),
-              'down', '--rmi', 'local', '--volumes'],
+        call(['docker', 'stack', 'rm', app],
              cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
         yaml = safe_load(open(join(app_path, KATA_COMPOSE), 'r', encoding='utf-8').read())
         if 'services' in yaml:
@@ -582,12 +539,11 @@ def cli():
 
 command = cli.command
 
-@command('apps')
+@command('ls')
 def cmd_apps():
-    """List apps, e.g.: kata apps"""
+    """List apps/stacks"""
     apps = listdir(APP_ROOT)
     if not apps:
-        echo("There are no applications deployed.")
         return
 
     containers = check_output(['docker', 'ps', '--format', '{{.Names}}'], universal_newlines=True).splitlines()
@@ -600,10 +556,10 @@ def cmd_apps():
         echo(('*' if running else ' ') + a, fg='green')
 
 
-@command('config')
+@command('config:stack')
 @argument('app')
 def cmd_config(app):
-    """Show config, e.g.: kata config <app>"""
+    """Show configuration for an app"""
     app = exit_if_invalid(app)
 
     config_file = join(APP_ROOT, app, KATA_COMPOSE)
@@ -613,57 +569,39 @@ def cmd_config(app):
         echo(f"Warning: app '{app}' not deployed, no config found.", fg='yellow')
 
 
-@command('config:get')
-@argument('app')
-@argument('setting')
-def cmd_config_get(app, setting):
-    """Get a config setting, e.g.: kata config:get <app> KEY"""
-    app = exit_if_invalid(app)
-
-    config_file = join(ENV_ROOT, app, '.env')
-    if exists(config_file):
-        env = parse_settings(config_file)
-        if setting in env:
-            echo(env[setting], fg='white')
-        else:
-            echo(f"Error: setting '{setting}' not found", fg='red')
-    else:
-        echo(f"Warning: app '{app}' not deployed, no config found.", fg='yellow')
-
-
-# TODO: ensure we keep .env updated
-
-@command('config:set')
-@argument('app')
-@argument('settings', nargs=-1, required=True)
-def cmd_config_set(app, settings):
-    """Set config, e.g.: kata config:set <app> KEY=value"""
-    app = exit_if_invalid(app)
-
-    config_file = join(ENV_ROOT, app, '.env')
-    env = {}
-    if exists(config_file):
-        env = parse_settings(config_file)
-
-    for s in settings:
+@command('secrets:set')
+@argument('secrets', nargs=-1, required=True)
+def cmd_secrets_set(secrets):
+    """Set a docker secret: name=value"""
+    for s in secrets:
         try:
             k, v = s.split('=', 1)
-            env[k] = v
-            echo(f"Setting {k}={v} for '{app}'", fg='white')
-        except Exception:
-            echo(f"Error: malformed setting '{s}'", fg='red')
+            echo(f"Setting {k}", fg='white')
+            run(['docker', 'secret', 'create', k, '-'], input=v,
+                 stdout=stdout, stderr=stderr, universal_newlines=True)
+        except Exception as e:
+            echo(f"Error {e} for secret '{k}'", fg='red')
             continue
 
-    write_config(config_file, env)
-    do_deploy(app)
+
+@command('secrets:rm')
+@argument('secret', required=True)
+def cmd_secrets_rm(secret):
+    """Remove a secret"""
+    call(['docker', 'secret', 'rm', secret], stdout=stdout, stderr=stderr, universal_newlines=True)
+
+
+@command('secrets:ls')
+def cmd_secrets_ls():
+    """List docker secrets defined in host."""
+    call(['docker', 'secret', 'ls'], stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
 @command('config:docker')
 @argument('app')
 def cmd_config_live(app):
-    """Show live config for running app, e.g.: kata config:live <app>"""
+    """Show live config for running app"""
     app = exit_if_invalid(app)
-
     config_file = join(APP_ROOT, app, DOCKER_COMPOSE)
     if exists(config_file):
         echo(open(config_file).read().strip(), fg='white')
@@ -674,28 +612,25 @@ def cmd_config_live(app):
 @command('config:caddy')
 @argument('app')
 def cmd_caddy_app(app):
-    """Show Caddy configuration for an app, e.g.: kata config:caddy <app>"""
+    """Show Caddy configuration for an app"""
     app = exit_if_invalid(app)
-
     caddy_json = caddy_get(app)
-
     if caddy_json:
         echo(dumps(caddy_json, indent=2), fg='white')
     else:
         echo(f"Warning: app '{app}' has no Caddy config.", fg='yellow')
 
 
-@command('destroy')
+@command('rm')
 @argument('app')
 @option('--force', '-f', is_flag=True, help='Force destruction without confirmation')
-@option('--wipe', '-w', is_flag=True, help='Delete data and config directories')
+@option('--wipe',  '-w', is_flag=True, help='Delete data and config directories')
 def cmd_destroy(app, force, wipe):
-    """Destroy an app, e.g.: kata destroy <app>"""
+    """Remove an app"""
     app = sanitize_app_name(app)
     app_path = join(APP_ROOT, app)
-
     if not exists(app_path):
-        echo(f"Error: app '{app}' not deployed!", fg='red')
+        echo(f"Error: stack '{app}' not deployed!", fg='red')
         return
 
     if not force:
@@ -717,50 +652,48 @@ def cmd_destroy(app, force, wipe):
                 rmtree(path)
             except Exception as e:
                 echo(f"Error removing {path}: {str(e)}", fg='red')
-    echo(f"Info: App '{app}' destroyed", fg='green')
+    echo(f"-----> '{app}' destroyed", fg='green')
     if not wipe:
         echo("Data and config directories were not deleted. Use --wipe to remove them.", fg='yellow')
 
+@command('docker', add_help_option=False, context_settings=dict(ignore_unknown_options=True))
+@argument('args', nargs=-1, required=True, type=UNPROCESSED)
+def cmd_ps(args):
+    """Pass-through Docker commands (logs, etc.)"""
+    call(['docker'] + list(args),
+         stdout=stdout, stderr=stderr, universal_newlines=True)
 
-@command('logs')
-@argument('app')
-@option('--follow', '-f', is_flag=True, help='Follow log output')
-def cmd_logs(app, follow):
-    """Show logs for an app, e.g.: kata logs <app> [service1] [service2]..."""
-    app = exit_if_invalid(app)
-    
-    cmd = ['docker', 'compose', '-f', join(APP_ROOT, app, DOCKER_COMPOSE), 'logs']
-    
-    if follow:
-        cmd.append('-f')
-        
-    call(cmd, stdout=stdout, stderr=stderr, universal_newlines=True)
+
+@command('docker:services')
+@argument('stack', required=True)
+def cmd_services(stack):
+    """List services for a stack"""
+    call(['docker', 'stack', 'services', stack],
+         stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
 @command('ps')
-@argument('app', required=False)
-def cmd_ps(app):
-    """List processes, e.g.: kata ps [<app>]"""
-    app = exit_if_invalid(app)
-    call(['docker', 'compose', '-f', join(APP_ROOT, app, DOCKER_COMPOSE), 'ps'],
+@argument('service', nargs=-1, required=True)
+def cmd_ps(service):
+    """List processes for a service"""
+    call(['docker', 'service', 'ps', service],
          stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
 @command('run')
-@argument('app')
 @argument('service', required=True)
 @argument('command', nargs=-1, required=True)
-def cmd_run(app, service, command):
-    """Run a command in the app environment, e.g.: kata run <app> <command>"""
+def cmd_run(service, command):
+    """Run a command inside a service"""
     app = exit_if_invalid(app)
-    call(['docker', 'compose', '-f', join(APP_ROOT, app, DOCKER_COMPOSE), 'run', service] + list(command),
+    call(['docker', 'exec', '-ti', service] + list(command),
          stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
 @command('restart')
 @argument('app')
 def cmd_restart(app):
-    """Restart an app, e.g.: kata restart <app>"""
+    """Restart an app"""
     app = exit_if_invalid(app)
     do_restart(app)
 
@@ -768,14 +701,14 @@ def cmd_restart(app):
 @command('stop')
 @argument('app')
 def cmd_stop(app):
-    """Stop an app, e.g.: kata stop <app>"""
+    """Stop an app"""
     app = exit_if_invalid(app)
     do_stop(app)
 
 
 @command('setup')
 def cmd_setup():
-    """Setup kata environment, e.g.: kata setup"""
+    """Setup the local kata environment"""
     for f in ROOT_FOLDERS:
         d = globals()[f]
         if not exists(d):
@@ -784,38 +717,34 @@ def cmd_setup():
     echo("Kata setup complete", fg='green')
 
 
-@command('setup:ssh')
-@argument('pubkey', required=False)
-def cmd_setup_ssh(pubkey):
-    """Setup SSH keys, e.g.: kata setup:ssh [pubkey]"""
-    if not pubkey:
-        # Look for an existing public key
-        default_key = join(environ['HOME'], '.ssh', 'id_rsa.pub')
-        if exists(default_key):
-            with open(default_key, 'r', encoding='utf-8') as f:
-                pubkey = f.read().strip()
+@command("setup:ssh")
+@argument('public_key_file')
+def cmd_setup_ssh(public_key_file):
+    """Set up a new SSH key (use - for stdin)"""
+    def add_helper(key_file):
+        if exists(key_file):
+            try:
+                fingerprint = str(check_output('ssh-keygen -lf ' + key_file, shell=True)).split(' ', 4)[1]
+                key = open(key_file, 'r').read().strip()
+                echo("Adding key '{}'.".format(fingerprint), fg='white')
+                setup_authorized_keys(fingerprint, KATA_SCRIPT, key)
+            except Exception:
+                echo("Error: invalid public key file '{}': {}".format(key_file, format_exc()), fg='red')
+        elif public_key_file == '-':
+            buffer = "".join(stdin.readlines())
+            with NamedTemporaryFile(mode="w") as f:
+                f.write(buffer)
+                f.flush()
+                add_helper(f.name)
         else:
-            echo("No public key provided and no default key found", fg='red')
-            echo("Generate one with: ssh-keygen -t rsa", fg='yellow')
-            return
-    try:
-        fingerprint = check_output(['ssh-keygen', '-lf', '-'],
-                                  input=pubkey.encode('utf-8'),
-                                  stderr=STDOUT,
-                                  universal_newlines=True).split()[1]
-    except Exception as e:
-        echo(f"Invalid public key format ({str(e)})", fg='red')
-        return
-    try:
-        setup_authorized_keys(fingerprint, KATA_SCRIPT, pubkey)
-        echo("SSH key setup complete", fg='green')
-    except Exception as e:
-        echo(f"Error setting up SSH keys: {str(e)}", fg='red')
+            echo("Error: public key file '{}' not found.".format(key_file), fg='red')
+
+    add_helper(public_key_file)
 
 
 @command('update')
 def cmd_update():
-    """Update kata to the latest version, e.g.: kata update"""
+    """Update kata to the latest version"""
     try:
         # Download the latest version
         echo("Downloading latest version...", fg='green')
@@ -826,14 +755,11 @@ def cmd_update():
             backup_file = f"{KATA_SCRIPT}.backup"
             copyfile(KATA_SCRIPT, backup_file)
             echo(f"Created backup at {backup_file}", fg='green')
-
             # Write the new version
             with open(KATA_SCRIPT, 'w', encoding='utf-8') as f:
                 f.write(response.text)
-
             # Make it executable
             chmod(KATA_SCRIPT, S_IRUSR | S_IWUSR | S_IXUSR)
-
             echo("Update complete! Restart any running kata processes.", fg='green')
         else:
             echo(f"Failed to download update: HTTP {response.status_code}", fg='red')
@@ -845,7 +771,7 @@ def cmd_update():
 
 # === Internal commands ===
 
-@command("git-hook")
+@command("git-hook", hidden=True)
 @argument('app')
 def cmd_git_hook(app):
     # INTERNAL: Post-receive git hook
@@ -865,7 +791,7 @@ def cmd_git_hook(app):
         do_deploy(app, newrev=newrev)
 
 
-@command("git-receive-pack")
+@command("git-receive-pack", hidden=True)
 @argument('app')
 def cmd_git_receive_pack(app):
     # INTERNAL: Handle git pushes for an app
@@ -888,7 +814,7 @@ cat | KATA_ROOT="{KATA_ROOT:s}" {KATA_SCRIPT:s} git-hook {app:s}""".format(**env
     call('git-shell -c "{}" '.format(argv[1] + " '{}'".format(app)), cwd=GIT_ROOT, shell=True)
 
 
-@command("git-upload-pack")
+@command("git-upload-pack", hidden=True)
 @argument('app')
 def cmd_git_upload_pack(app):
     # INTERNAL: Handle git upload pack for an app
@@ -899,16 +825,16 @@ def cmd_git_upload_pack(app):
     call('git-shell -c "{}" '.format(argv[1] + " '{}'".format(app)), cwd=GIT_ROOT, shell=True)
 
 
-@command("scp")
-@argument('args', nargs=-1, required=True)
+@command("scp", context_settings=dict(ignore_unknown_options=True))
+@argument('args', nargs=-1, required=True, type=UNPROCESSED)
 def cmd_scp(args):
-    """Simple wrapper to allow scp to work."""
+    """Copy files to/from the server"""
     call(["scp"] + list(args), cwd=abspath(environ['HOME']))
 
 
 @command("help")
 def cmd_help():
-    """display help for kata"""
+    """Display help"""
     show_help()
 
 
