@@ -117,6 +117,7 @@ def base_env(app, env=None) -> dict:
         base.update(env)
 
     # finally, an ENV or .env file in the config directory overrides things
+    # TODO: validate if this still makes sense
     for name in ['ENV', '.env']:
         env_file = join(CONFIG_ROOT, app, name)
         if exists(env_file):
@@ -160,15 +161,6 @@ def setup_authorized_keys(ssh_fingerprint, script_path, pubkey):
         h.write(f"""command="FINGERPRINT={ssh_fingerprint:s} NAME=default {script_path:s} $SSH_ORIGINAL_COMMAND",no-agent-forwarding,no-user-rc,no-X11-forwarding,no-port-forwarding {pubkey:s}\n""")
     chmod(dirname(authorized_keys), S_IRUSR | S_IWUSR | S_IXUSR)
     chmod(authorized_keys, S_IRUSR | S_IWUSR)
-
-
-def command_output(cmd):
-    """executes a command and grabs its output, if any"""
-    try:
-        env = environ
-        return check_output(cmd, env=env, shell=True, universal_newlines=True)
-    except Exception as e:
-        return str(e)
 
 # === Docker Helpers ===
 
@@ -227,22 +219,6 @@ def docker_handle_runtime_environment(app_name, runtime, destroy=False, env=None
         call(['docker', 'run', '--rm'] + volumes + ['-i', f'kata/{runtime}'] + cmd,
          cwd=join(APP_ROOT, app_name), env=env, stdout=stdout, stderr=stderr, universal_newlines=True)
 
-
-def docker_cleanup_runtime_environment(app_name, runtime):
-    """Cleans up the Docker environment for an app"""
-    app_path = join(APP_ROOT, app_name)
-    if exists(app_path):
-        echo(f"Cleaning up Docker environment for '{app_name}'", fg='green')
-        # Remove the Docker volumes associated with the app
-        volumes = ['app', 'config', 'data', 'venv']
-        for volume in volumes:
-            volume_path = join(app_path, volume)
-            if exists(volume_path):
-                rmtree(volume_path, ignore_errors=True)
-        echo(f"Info: Removed volumes '{volumes}' for app '{app_name}'", fg='green')
-    else:
-        echo(f"Warning: App '{app_name}' does not exist, skipping cleanup.", fg='yellow')
-
 # === App Management ===
 
 def exit_if_invalid(app, deployed=False):
@@ -253,24 +229,6 @@ def exit_if_invalid(app, deployed=False):
         echo(f"Error: app '{app}' not deployed!", fg='red')
         exit(1)
     return app
-
-
-def parse_settings(filename, env={}):
-    """Parses a settings file and returns a dict with environment variables"""
-    if not exists(filename):
-        return {}
-
-    with open(filename, 'r') as settings:
-        for line in settings:
-            if line[0] == '#' or len(line.strip()) == 0:  # ignore comments and newlines
-                continue
-            try:
-                k, v = map(lambda x: x.strip(), line.split("=", 1))
-                env[k] = expandvars(v, env)
-            except Exception as e:
-                echo(f"Error: malformed setting '{line}', ignoring file: {e}", fg='red')
-                return {}
-    return env
 
 
 def sanitize_app_name(app) -> str:
@@ -581,12 +539,11 @@ def cli():
 
 command = cli.command
 
-@command('apps')
+@command('ls')
 def cmd_apps():
     """List apps/stacks"""
     apps = listdir(APP_ROOT)
     if not apps:
-        echo("There are no applications deployed.")
         return
 
     containers = check_output(['docker', 'ps', '--format', '{{.Names}}'], universal_newlines=True).splitlines()
@@ -610,51 +567,6 @@ def cmd_config(app):
         echo(open(config_file).read().strip(), fg='white')
     else:
         echo(f"Warning: app '{app}' not deployed, no config found.", fg='yellow')
-
-
-@command('config:get')
-@argument('app')
-@argument('setting')
-def cmd_config_get(app, setting):
-    """Get a config setting"""
-    app = exit_if_invalid(app)
-
-    config_file = join(ENV_ROOT, app, '.env')
-    if exists(config_file):
-        env = parse_settings(config_file)
-        if setting in env:
-            echo(env[setting], fg='white')
-        else:
-            echo(f"Error: setting '{setting}' not found", fg='red')
-    else:
-        echo(f"Warning: app '{app}' not deployed, no config found.", fg='yellow')
-
-
-# TODO: ensure we keep .env updated
-
-@command('config:set')
-@argument('app')
-@argument('settings', nargs=-1, required=True)
-def cmd_config_set(app, settings):
-    """Set a config setting"""
-    app = exit_if_invalid(app)
-
-    config_file = join(ENV_ROOT, app, '.env')
-    env = {}
-    if exists(config_file):
-        env = parse_settings(config_file)
-
-    for s in settings:
-        try:
-            k, v = s.split('=', 1)
-            env[k] = v
-            echo(f"Setting {k}={v} for '{app}'", fg='white')
-        except Exception:
-            echo(f"Error: malformed setting '{s}'", fg='red')
-            continue
-
-    write_config(config_file, env)
-    do_deploy(app)
 
 
 @command('secrets:set')
@@ -744,36 +656,15 @@ def cmd_destroy(app, force, wipe):
     if not wipe:
         echo("Data and config directories were not deleted. Use --wipe to remove them.", fg='yellow')
 
-# docker stack services rss2mastodon --format {{.Name}}
-# docker service logs foo
-
-@command('logs')
-@argument('service', nargs=-1, required=True)
-@option('--follow', '-f', is_flag=True, help='Follow log output')
-@option('--timestamps', '-t', is_flag=True, help='Timestamps')
-@option('--clean', '-c', is_flag=True, help='Clean log output')
-def cmd_logs(service, follow, timestamps, clean):
-    """Show logs for a service"""
-    cmd = ['docker', 'service', 'logs', service]
-    if follow:
-        cmd.append('-f')
-    if timestamps:
-        cmd.append('-t')
-    if clean:
-        cmd.extend(['|', 'sed', "'s/^[^|]*|\s*//'"])
-
-    call(cmd, stdout=stdout, stderr=stderr, universal_newlines=True)
-
-
 @command('docker', add_help_option=False, context_settings=dict(ignore_unknown_options=True))
 @argument('args', nargs=-1, required=True, type=UNPROCESSED)
 def cmd_ps(args):
-    """List processes for a service"""
+    """Pass-through Docker commands (logs, etc.)"""
     call(['docker'] + list(args),
          stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
-@command('services')
+@command('docker:services')
 @argument('stack', required=True)
 def cmd_services(stack):
     """List services for a stack"""
