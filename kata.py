@@ -253,7 +253,7 @@ def parse_compose(app_name, filename) -> tuple:
     env = base_env(app_name, env)
     env_dump = [f"{k}={v}" for k, v in env.items()]
 
-    echo(f"Using environment for {app_name}: {",".join(env_dump)}", fg='green')
+    #echo(f"Using environment for {app_name}: {",".join(env_dump)}", fg='green')
     if not "services" in data:
         echo(f"Warning: no 'services' section found in {filename}", fg='yellow')
     services = data.get("services", {})
@@ -263,7 +263,7 @@ def parse_compose(app_name, filename) -> tuple:
         if not "image" in service:
             if "runtime" in service:
                 service["image"] = f"kata/{service["runtime"]}"
-                echo(f"Info: service '{service_name}' will use runtime '{service['runtime']}'", fg='green')
+                echo(f"=====> '{service_name}' will use runtime '{service['runtime']}'", fg='green')
                 if service["image"] in RUNTIME_IMAGES:
                     docker_handle_runtime_environment(app_name, service["runtime"], env=env)
                 else:
@@ -271,8 +271,9 @@ def parse_compose(app_name, filename) -> tuple:
                     exit(1)
                 del service["runtime"]
             if not "volumes" in service:
-                echo(f"Info: service '{service_name}' has no 'volumes' specified, applying defaults", fg='green')
                 service["volumes"] = ["app:/app", "config:/config", "data:/data", "venv:/venv"]
+            else:
+                echo(f"Warning: service '{service_name}' has custom volumes, ensure they are correct", fg='yellow')
         if not "command" in service:
             echo(f"Warning: service '{service_name}' has no 'command' specified", fg='yellow')
             continue
@@ -290,7 +291,6 @@ def parse_compose(app_name, filename) -> tuple:
         echo(f"Warning: no 'caddy' section found, no HTTP/S handling done.", fg='yellow')
 
     if not "volumes" in data.keys():
-        echo(f"Info: applying default volume setup.", fg='green')
         volumes = {
             "app": join(APP_ROOT, app_name),
             "config": join(CONFIG_ROOT, app_name),
@@ -494,16 +494,16 @@ def do_deploy(app, deltas={}, newrev=None):
 def do_start(app):
     app_path = join(APP_ROOT, app)
     if exists(join(app_path, DOCKER_COMPOSE)):
-        echo(f"Starting app '{app}'", fg='yellow')
+        echo(f"-----> Starting app '{app}'", fg='yellow')
         # Stop the app using docker-compose
-        call(['docker', 'stack', 'deploy', app, f'--compose-file={join(app_path, DOCKER_COMPOSE)}'],
+        call(['docker', 'stack', 'deploy', app, f'--compose-file={join(app_path, DOCKER_COMPOSE)}', '--detach=true', '--resolve-image=never', '--prune'],
              cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
 def do_stop(app):
     app_path = join(APP_ROOT, app)
     if exists(join(app_path, DOCKER_COMPOSE)):
-        echo(f"Stopping app '{app}'", fg='yellow')
+        echo(f"-----> Stopping app '{app}'", fg='yellow')
         # Stop the app using docker-compose
         call(['docker', 'stack', 'rm', app],
              cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
@@ -518,7 +518,7 @@ def do_remove(app):
         yaml = safe_load(open(join(app_path, KATA_COMPOSE), 'r', encoding='utf-8').read())
         if 'services' in yaml:
             for service_name, service in yaml['services'].items():
-                echo("Removing service: " + service_name, fg='yellow')
+                echo("---> Removing service: " + service_name, fg='yellow')
                 if 'runtime' in service:
                     runtime = service['runtime']
                     docker_handle_runtime_environment(app, runtime, destroy=True)
@@ -572,7 +572,12 @@ def cmd_config(app):
 @command('secrets:set')
 @argument('secrets', nargs=-1, required=True)
 def cmd_secrets_set(secrets):
-    """Set a docker secret: name=value"""
+    """Set a docker secret: name=value or provide name and value via stdin (multiline supported)"""
+    if not secrets:
+        k = input("Secret name: ")
+        echo("Enter secret value (end with EOF / Ctrl-D):", fg='yellow')
+        v = sys.stdin.read().strip()
+        secrets = [f"{k}={v}"]
     for s in secrets:
         try:
             k, v = s.split('=', 1)
