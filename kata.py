@@ -8,25 +8,22 @@ try:
 except AssertionError:
     exit("Kata requires Python 3.12 or above")
 
-from click import argument, Path, echo as click_echo, group, option, UNPROCESSED
-from yaml import safe_load, safe_dump
-from collections import deque
-from fcntl import fcntl, F_SETFL, F_GETFL
-from glob import glob
-from json import loads, dumps, JSONDecodeError
 from http.client import HTTPConnection, HTTPSConnection
-from os import chmod, getgid, getuid, symlink, unlink, pathsep, remove, stat, listdir, environ, makedirs, O_NONBLOCK
-from os.path import abspath, basename, dirname, exists, getmtime, join, realpath, splitext, isdir
-from re import sub, match
-from shlex import split as shsplit
-from shutil import copyfile, rmtree, which
-from socket import socket, AF_INET, SOCK_STREAM
+from json import dumps, loads
+from os import chmod, environ, getgid, getuid, listdir, makedirs, remove, stat
+from os.path import abspath, dirname, exists, join, realpath
+from re import sub
+from shutil import copyfile, rmtree
 from stat import S_IRUSR, S_IWUSR, S_IXUSR
-from subprocess import call, check_output, Popen, STDOUT, run
-from sys import argv, stdin, stdout, stderr, version_info, exit, path as sys_path
+from subprocess import STDOUT, call, check_output, run
+from sys import argv, stderr, stdin, stdout, version_info
 from tempfile import NamedTemporaryFile
-from time import sleep
 from traceback import format_exc
+
+from click import UNPROCESSED, argument
+from click import echo as click_echo
+from click import group, option
+from yaml import safe_dump, safe_load
 
 # === Make sure we can access all system and user binaries ===
 
@@ -572,20 +569,75 @@ def cmd_config(app):
 @command('secrets:set')
 @argument('secrets', nargs=-1, required=True)
 def cmd_secrets_set(secrets):
-    """Set a docker secret: name=value or provide name and value via stdin (multiline supported)"""
+    """Set a docker secret: name=value, name=@filename, name=- (stdin), or just name (prompt)"""
     if not secrets:
         k = input("Secret name: ")
         echo("Enter secret value (end with EOF / Ctrl-D):", fg='yellow')
-        v = sys.stdin.read().strip()
+        v = stdin.read().strip()
         secrets = [f"{k}={v}"]
+    
     for s in secrets:
         try:
-            k, v = s.split('=', 1)
-            echo(f"Setting {k}", fg='white')
-            run(['docker', 'secret', 'create', k, '-'], input=v,
-                 stdout=stdout, stderr=stderr, universal_newlines=True)
+            if '=' in s:
+                k, v = s.split('=', 1)
+                
+                # Handle different value sources
+                if v == '-':
+                    # Read from stdin
+                    echo(f"Reading secret '{k}' from stdin (end with EOF / Ctrl-D):", fg='yellow')
+                    content = stdin.read()
+                elif v.startswith('@'):
+                    # Read from file
+                    filename = v[1:]  # Remove the @ prefix
+                    if not exists(filename):
+                        echo(f"Error: File '{filename}' not found", fg='red')
+                        continue
+                    try:
+                        # Try to read as text first, fall back to binary if needed
+                        try:
+                            with open(filename, 'r', encoding='utf-8') as f:
+                                content = f.read()
+                        except UnicodeDecodeError:
+                            # File contains binary data, read as bytes and decode
+                            with open(filename, 'rb') as f:
+                                content = f.read().decode('utf-8', errors='replace')
+                        echo(f"Reading secret '{k}' from file '{filename}'", fg='green')
+                    except Exception as e:
+                        echo(f"Error reading file '{filename}': {str(e)}", fg='red')
+                        continue
+                elif exists(v):
+                    # If value looks like a file path and the file exists, read from it
+                    try:
+                        # Try to read as text first, fall back to binary if needed
+                        try:
+                            with open(v, 'r', encoding='utf-8') as f:
+                                content = f.read()
+                        except UnicodeDecodeError:
+                            # File contains binary data, read as bytes and decode
+                            with open(v, 'rb') as f:
+                                content = f.read().decode('utf-8', errors='replace')
+                        echo(f"Reading secret '{k}' from file '{v}'", fg='green')
+                    except Exception as e:
+                        echo(f"Error reading file '{v}': {str(e)}", fg='red')
+                        continue
+                else:
+                    # Treat as literal value
+                    content = v
+            else:
+                # No = sign, prompt for value
+                k = s
+                echo(f"Enter value for secret '{k}' (end with EOF / Ctrl-D):", fg='yellow')
+                content = stdin.read()
+            
+            echo(f"Setting secret '{k}'", fg='white')
+            run(['docker', 'secret', 'create', k, '-'], input=content,
+                 stdout=stdout, stderr=stderr, universal_newlines=True, text=True, check=True)
+                 
+        except ValueError:
+            echo(f"Error: Invalid format '{s}'. Use 'name=value', 'name=@filename', 'name=-', or just 'name'", fg='red')
+            continue
         except Exception as e:
-            echo(f"Error {e} for secret '{k}'", fg='red')
+            echo(f"Error setting secret '{k}': {str(e)}", fg='red')
             continue
 
 
