@@ -60,6 +60,8 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN apt update \
  && apt dist-upgrade -y \
  && apt-get -qq install \
+    git \
+    openssh-client \
     python3-pip \
     python3-dev \
     python3-venv
@@ -76,6 +78,8 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN apt update \
  && apt dist-upgrade -y \
  && apt-get -qq install \
+    git \
+    openssh-client \
     nodejs \
     npm \
     yarnpkg
@@ -248,9 +252,8 @@ def parse_compose(app_name, filename) -> tuple:
         env = {k: str(v) for k, v in data["environment"].items()}
 
     env = base_env(app_name, env)
-    env_dump = [f"{k}={v}" for k, v in env.items()]
-
-    #echo(f"Using environment for {app_name}: {",".join(env_dump)}", fg='green')
+    # Prepare env as a dict; we'll merge into services preserving service-defined values
+    # echo(f"Using environment for {app_name}: {','.join([f'{k}={v}' for k, v in env.items()])}", fg='green')
     if not "services" in data:
         echo(f"Warning: no 'services' section found in {filename}", fg='yellow')
     services = data.get("services", {})
@@ -259,7 +262,7 @@ def parse_compose(app_name, filename) -> tuple:
         echo(f"-----> Preparing service '{service_name}'", fg='green')
         if not "image" in service:
             if "runtime" in service:
-                service["image"] = f"kata/{service["runtime"]}"
+                service["image"] = f"kata/{service['runtime']}"
                 echo(f"=====> '{service_name}' will use runtime '{service['runtime']}'", fg='green')
                 if service["image"] in RUNTIME_IMAGES:
                     docker_handle_runtime_environment(app_name, service["runtime"], env=env)
@@ -276,9 +279,31 @@ def parse_compose(app_name, filename) -> tuple:
             continue
         if not "ports" in service:
             echo(f"Warning: service '{service_name}' has no 'ports' specified", fg='yellow')
-        if not "environment" in service:
-            service["environment"] = []
-        service["environment"].extend(env_dump)
+        # Normalize and merge environment
+        if "environment" not in service:
+            service["environment"] = {}
+        elif isinstance(service["environment"], list):
+            # Convert list form ["K=V", "X=Y"] into a dict
+            converted = {}
+            for item in service["environment"]:
+                if isinstance(item, str):
+                    if '=' in item:
+                        k, v = item.split('=', 1)
+                        converted[str(k)] = str(v)
+                    else:
+                        # No value provided; default to empty string
+                        converted[str(item)] = ""
+                elif isinstance(item, dict):
+                    for k, v in item.items():
+                        converted[str(k)] = str(v)
+            service["environment"] = converted
+        elif not isinstance(service["environment"], dict):
+            # Fallback to dict
+            service["environment"] = {}
+        # Merge base env without overriding service-defined values
+        for k, v in env.items():
+            if k not in service["environment"]:
+                service["environment"][k] = str(v)
 
     caddy_config = {}
     if "caddy" in data.keys():
@@ -887,6 +912,14 @@ def cmd_git_upload_pack(app):
 def cmd_scp(args):
     """Copy files to/from the server"""
     call(["scp"] + list(args), cwd=abspath(environ['HOME']))
+
+
+# Helper to print CLI help
+
+def show_help():
+    from click import Context
+    ctx = Context(cli)
+    echo(cli.get_help(ctx), fg='white')
 
 
 @command("help")
