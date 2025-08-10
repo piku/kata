@@ -203,6 +203,7 @@ def docker_handle_runtime_environment(app_name, runtime, destroy=False, env=None
     if destroy:
         cmds = {
             'python': [['chown', '-hR', f'{PUID}:{PGID}', '/data'], 
+                       ['chown', '-hR', f'{PUID}:{PGID}', '/app'], 
                        ['chown', '-hR', f'{PUID}:{PGID}', '/venv'], 
                        ['chown', '-hR', f'{PUID}:{PGID}', '/config']],
             'nodejs': [['chown', '-hR', f'{PUID}:{PGID}', '/data'], 
@@ -217,6 +218,7 @@ def docker_handle_runtime_environment(app_name, runtime, destroy=False, env=None
             'nodejs': [['npm', 'install' ]]
         }
     for cmd in cmds[runtime]:
+        echo(f"Running cleanup command: {' '.join(cmd)}", fg='green')
         call(['docker', 'run', '--rm'] + volumes + ['-i', f'kata/{runtime}'] + cmd,
          cwd=join(APP_ROOT, app_name), env=env, stdout=stdout, stderr=stderr, universal_newlines=True)
 
@@ -534,9 +536,6 @@ def do_stop(app):
 def do_remove(app):
     app_path = join(APP_ROOT, app)
     if exists(join(app_path, DOCKER_COMPOSE)):
-        echo(f"-----> Removing '{app}'", fg='yellow')
-        call(['docker', 'stack', 'rm', app],
-             cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
         yaml = safe_load(open(join(app_path, KATA_COMPOSE), 'r', encoding='utf-8').read())
         if 'services' in yaml:
             for service_name, service in yaml['services'].items():
@@ -544,6 +543,9 @@ def do_remove(app):
                 if 'runtime' in service:
                     runtime = service['runtime']
                     docker_handle_runtime_environment(app, runtime, destroy=True)
+        echo(f"-----> Removing '{app}'", fg='yellow')
+        call(['docker', 'stack', 'rm', app],
+             cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
 def do_restart(app):
