@@ -13,7 +13,7 @@ from json import dumps, loads
 from os import chmod, environ, getgid, getuid, listdir, makedirs, remove, stat
 from os.path import abspath, dirname, exists, join, realpath
 from re import sub
-from shutil import copyfile, rmtree
+from shutil import copyfile, rmtree, which
 from stat import S_IRUSR, S_IWUSR, S_IXUSR
 from subprocess import STDOUT, call, check_output, run
 from sys import argv, stderr, stdin, stdout, version_info
@@ -48,6 +48,7 @@ PUID = getuid()
 PGID = getgid()
 DOCKER_COMPOSE = ".docker-compose.yaml"
 KATA_COMPOSE = "kata-compose.yaml"
+KATA_MODE_FILE = ".kata-mode"  # stores 'swarm' or 'compose' per app
 ROOT_FOLDERS = ['APP_ROOT', 'DATA_ROOT', 'ENV_ROOT', 'CONFIG_ROOT', 'GIT_ROOT', 'LOG_ROOT']
 if KATA_BIN not in environ['PATH']:
     environ['PATH'] = KATA_BIN + ":" + environ['PATH']
@@ -339,6 +340,71 @@ def parse_compose(app_name, filename) -> tuple:
         del data['environment']
     return (data, caddy_config)
 
+# === Orchestrator helpers ===
+
+def docker_supports_swarm() -> bool:
+    try:
+        # docker info exits 0 even if not in swarm; we'll check Swarm: inactive in output
+        out = check_output(['docker', 'info', '--format', '{{.Swarm.LocalNodeState}}'], universal_newlines=True).strip()
+        return out.lower() == 'active'
+    except Exception:
+        return False
+
+def get_app_mode(app: str) -> str:
+    """Returns 'swarm' or 'compose' for this app. Default: 'compose' if swarm inactive, else 'swarm'.
+       Allows override via x-kata-mode in kata-compose.yaml or .kata-mode file saved on deploy."""
+    app_path = join(APP_ROOT, app)
+    # persisted override file
+    mf = join(app_path, KATA_MODE_FILE)
+    if exists(mf):
+        try:
+            return open(mf, 'r', encoding='utf-8').read().strip()
+        except Exception:
+            pass
+    # compose file override
+    compose_path = join(app_path, KATA_COMPOSE)
+    if exists(compose_path):
+        try:
+            cfg = safe_load(open(compose_path, 'r', encoding='utf-8'))
+            mode = cfg.get('x-kata-mode')
+            if mode in ('swarm', 'compose'):
+                return mode
+        except Exception:
+            pass
+    # default based on swarm
+    return 'swarm' if docker_supports_swarm() else 'compose'
+
+def set_app_mode(app: str, mode: str):
+    app_path = join(APP_ROOT, app)
+    try:
+        with open(join(app_path, KATA_MODE_FILE), 'w', encoding='utf-8') as f:
+            f.write(mode)
+    except Exception:
+        pass
+
+def get_compose_cmd() -> list:
+    """Return the base compose command: ['docker','compose'] if available, else ['docker-compose']."""
+    # Prefer docker compose (V2)
+    try:
+        out = check_output(['docker', 'compose', 'version'], stderr=STDOUT, universal_newlines=True)
+        if out:
+            return ['docker', 'compose']
+    except Exception:
+        pass
+    # Fallback to docker-compose (V1)
+    if which('docker-compose'):
+        return ['docker-compose']
+    # Last resort: assume docker compose exists
+    return ['docker', 'compose']
+
+def require_swarm_or_warn() -> bool:
+    """Ensure Docker Swarm is active; print a helpful error if not."""
+    if not docker_supports_swarm():
+        echo("Error: Docker Swarm mode is not active. This command requires Swarm.", fg='red')
+        echo("Tip: Initialize Swarm with 'docker swarm init' or switch app mode to 'compose' where applicable.", fg='yellow')
+        return False
+    return True
+
 # Caddy API Management
 
 def validate_caddy_json(config):
@@ -510,6 +576,12 @@ def do_deploy(app, deltas={}, newrev=None):
             f.write(safe_dump(compose))
         if caddy:
             caddy_config(app, caddy)
+        # Record chosen mode for subsequent lifecycle ops
+        mode = 'swarm' if docker_supports_swarm() else 'compose'
+        cfg_override = safe_load(open(compose_file, 'r', encoding='utf-8')) if exists(compose_file) else {}
+        if isinstance(cfg_override, dict) and cfg_override.get('x-kata-mode') in ('swarm', 'compose'):
+            mode = cfg_override['x-kata-mode']
+        set_app_mode(app, mode)
         do_start(app)
     else:
         echo(f"Error: app '{app}' not found.", fg='red')
@@ -518,19 +590,30 @@ def do_deploy(app, deltas={}, newrev=None):
 def do_start(app):
     app_path = join(APP_ROOT, app)
     if exists(join(app_path, DOCKER_COMPOSE)):
-        echo(f"-----> Starting app '{app}'", fg='yellow')
-        # Stop the app using docker-compose
-        call(['docker', 'stack', 'deploy', app, f'--compose-file={join(app_path, DOCKER_COMPOSE)}', '--detach=true', '--resolve-image=never', '--prune'],
-             cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
+        mode = get_app_mode(app)
+        echo(f"-----> Starting app '{app}' (mode: {mode})", fg='yellow')
+        compose_path = join(app_path, DOCKER_COMPOSE)
+        if mode == 'swarm':
+            call(['docker', 'stack', 'deploy', app, f'--compose-file={compose_path}', '--detach=true', '--resolve-image=never', '--prune'],
+                 cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
+        else:
+            # docker compose up -d
+            call(get_compose_cmd() + ['-f', compose_path, 'up', '-d', '--remove-orphans'],
+                 cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
 def do_stop(app):
     app_path = join(APP_ROOT, app)
     if exists(join(app_path, DOCKER_COMPOSE)):
-        echo(f"-----> Stopping app '{app}'", fg='yellow')
-        # Stop the app using docker-compose
-        call(['docker', 'stack', 'rm', app],
-             cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
+        mode = get_app_mode(app)
+        echo(f"-----> Stopping app '{app}' (mode: {mode})", fg='yellow')
+        compose_path = join(app_path, DOCKER_COMPOSE)
+        if mode == 'swarm':
+            call(['docker', 'stack', 'rm', app],
+                 cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
+        else:
+            call(get_compose_cmd() + ['-f', compose_path, 'down', '--remove-orphans'],
+                 cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
 def do_remove(app):
@@ -543,9 +626,15 @@ def do_remove(app):
                 if 'runtime' in service:
                     runtime = service['runtime']
                     docker_handle_runtime_environment(app, runtime, destroy=True)
-        echo(f"-----> Removing '{app}'", fg='yellow')
-        call(['docker', 'stack', 'rm', app],
-             cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
+        mode = get_app_mode(app)
+        echo(f"-----> Removing '{app}' (mode: {mode})", fg='yellow')
+        compose_path = join(app_path, DOCKER_COMPOSE)
+        if mode == 'swarm':
+            call(['docker', 'stack', 'rm', app],
+                 cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
+        else:
+            call(get_compose_cmd() + ['-f', compose_path, 'down', '--volumes', '--remove-orphans'],
+                 cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
 def do_restart(app):
@@ -597,6 +686,8 @@ def cmd_config(app):
 @argument('secrets', nargs=-1, required=True)
 def cmd_secrets_set(secrets):
     """Set a docker secret: name=value, name=@filename, name=- (stdin), or just name (prompt)"""
+    if not require_swarm_or_warn():
+        return
     if not secrets:
         k = input("Secret name: ")
         echo("Enter secret value (end with EOF / Ctrl-D):", fg='yellow')
@@ -672,12 +763,16 @@ def cmd_secrets_set(secrets):
 @argument('secret', required=True)
 def cmd_secrets_rm(secret):
     """Remove a secret"""
+    if not require_swarm_or_warn():
+        return
     call(['docker', 'secret', 'rm', secret], stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
 @command('secrets:ls')
 def cmd_secrets_ls():
     """List docker secrets defined in host."""
+    if not require_swarm_or_warn():
+        return
     call(['docker', 'secret', 'ls'], stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
@@ -779,6 +874,31 @@ def cmd_run(service, command):
 def cmd_restart(app):
     """Restart an app"""
     app = exit_if_invalid(app)
+    do_restart(app)
+
+
+@command('mode')
+@argument('app')
+@argument('mode', required=False)
+def cmd_mode(app, mode=None):
+    """Get or set deployment mode for an app: compose|swarm"""
+    app = exit_if_invalid(app)
+    current = get_app_mode(app)
+    if not mode:
+        echo(f"{app}: {current}", fg='white')
+        return
+    if mode not in ('compose', 'swarm'):
+        echo("Error: mode must be 'compose' or 'swarm'", fg='red')
+        return
+    if mode == 'swarm' and not docker_supports_swarm():
+        echo("Error: Docker Swarm is not active; cannot set mode to 'swarm'", fg='red')
+        return
+    if mode == current:
+        echo(f"Mode unchanged ({current})", fg='yellow')
+        return
+    set_app_mode(app, mode)
+    echo(f"Set mode for '{app}' -> {mode}", fg='green')
+    echo("Restarting to apply mode change...", fg='yellow')
     do_restart(app)
 
 
