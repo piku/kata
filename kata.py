@@ -864,7 +864,6 @@ def cmd_ps(service):
 @argument('command', nargs=-1, required=True)
 def cmd_run(service, command):
     """Run a command inside a service"""
-    app = exit_if_invalid(app)
     call(['docker', 'exec', '-ti', service] + list(command),
          stdout=stdout, stderr=stderr, universal_newlines=True)
 
