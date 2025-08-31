@@ -164,11 +164,18 @@ def parse_args():
         default="./outputs",
         help="Directory to save output audio files",
     )
+    # Device selection with MPS (Apple Silicon) priority, then CUDA, else CPU
+    if torch.backends.mps.is_available():  # type: ignore[attr-defined]
+        default_device = "mps"
+    elif torch.cuda.is_available():
+        default_device = "cuda"
+    else:
+        default_device = "cpu"
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device for tensor tests",
+        default=default_device,
+        help="Device to run inference on (mps|cuda|cpu)",
     )
     parser.add_argument(
         "--cfg_scale",
@@ -243,26 +250,50 @@ def main():
     
     # Load processor
     print(f"Loading processor & model from {args.model_path}")
+    print(f"Requested device: {args.device}")
     processor = VibeVoiceProcessor.from_pretrained(args.model_path)
 
     # Load model
+    # Determine torch dtype & attention implementation per device
+    target_device = args.device.lower()
+    if target_device == 'mps':
+        # bfloat16 not broadly supported on MPS; use float16
+        load_dtype = torch.float16
+        attn_impl_primary = 'sdpa'  # flash attention not available on MPS
+        use_device_map = None  # load on CPU then move
+    elif target_device == 'cpu':
+        load_dtype = torch.float32
+        attn_impl_primary = 'sdpa'
+        use_device_map = 'cpu'
+    else:  # cuda
+        load_dtype = torch.bfloat16
+        attn_impl_primary = 'flash_attention_2'
+        use_device_map = 'cuda'
+
     try:
         model = VibeVoiceForConditionalGenerationInference.from_pretrained(
             args.model_path,
-            torch_dtype=torch.bfloat16,
-            device_map='cuda',
-            attn_implementation='flash_attention_2' # flash_attention_2 is recommended
+            torch_dtype=load_dtype,
+            device_map=use_device_map,
+            attn_implementation=attn_impl_primary
         )
     except Exception as e:
         print(f"[ERROR] : {type(e).__name__}: {e}")
         print(traceback.format_exc())
-        print("Error loading the model. Trying to use SDPA. However, note that only flash_attention_2 has been fully tested, and using SDPA may result in lower audio quality.")
+        print("Primary attention backend failed. Falling back to SDPA (may reduce quality).")
+        fallback_attn = 'sdpa'
         model = VibeVoiceForConditionalGenerationInference.from_pretrained(
             args.model_path,
-            torch_dtype=torch.bfloat16,
-            device_map='cuda',
-            attn_implementation='sdpa'
+            torch_dtype=load_dtype,
+            device_map=use_device_map if use_device_map != 'cuda' else 'cuda',
+            attn_implementation=fallback_attn
         )
+
+    # Move model to MPS explicitly if needed
+    if target_device == 'mps':
+        model.to('mps')
+        torch.mps.synchronize()
+        print("Model moved to MPS device.")
 
     model.eval()
     model.set_ddpm_inference_steps(num_steps=10)

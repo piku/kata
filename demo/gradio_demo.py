@@ -35,7 +35,16 @@ class VibeVoiceDemo:
     def __init__(self, model_path: str, device: str = "cuda", inference_steps: int = 5):
         """Initialize the VibeVoice demo with model loading."""
         self.model_path = model_path
-        self.device = device
+        # Resolve device preference with automatic detection (mps > cuda > cpu)
+        if device == 'auto':
+            if torch.backends.mps.is_available():  # type: ignore[attr-defined]
+                self.device = 'mps'
+            elif torch.cuda.is_available():
+                self.device = 'cuda'
+            else:
+                self.device = 'cpu'
+        else:
+            self.device = device
         self.inference_steps = inference_steps
         self.is_generating = False  # Track generation state
         self.stop_generation = False  # Flag to stop generation
@@ -47,40 +56,60 @@ class VibeVoiceDemo:
     def load_model(self):
         """Load the VibeVoice model and processor."""
         print(f"Loading processor & model from {self.model_path}")
-        
+        print(f"Target device: {self.device}")
+
         # Load processor
         self.processor = VibeVoiceProcessor.from_pretrained(
             self.model_path,
         )
-        
+
+        # Decide dtype and attention backend per device
+        if self.device == 'mps':
+            load_dtype = torch.float16
+            attn_impl_primary = 'sdpa'
+            device_map = None  # load then move
+        elif self.device == 'cpu':
+            load_dtype = torch.float32
+            attn_impl_primary = 'sdpa'
+            device_map = 'cpu'
+        else:  # cuda
+            load_dtype = torch.bfloat16
+            attn_impl_primary = 'flash_attention_2'
+            device_map = 'cuda'
+
         # Load model
         try:
             self.model = VibeVoiceForConditionalGenerationInference.from_pretrained(
                 self.model_path,
-                torch_dtype=torch.bfloat16,
-                device_map='cuda',
-                attn_implementation='flash_attention_2' # flash_attention_2 is recommended
+                torch_dtype=load_dtype,
+                device_map=device_map,
+                attn_implementation=attn_impl_primary
             )
         except Exception as e:
             print(f"[ERROR] : {type(e).__name__}: {e}")
             print(traceback.format_exc())
-            print("Error loading the model. Trying to use SDPA. However, note that only flash_attention_2 has been fully tested, and using SDPA may result in lower audio quality.")
+            print("Primary attention backend failed. Falling back to SDPA (may reduce quality).")
             self.model = VibeVoiceForConditionalGenerationInference.from_pretrained(
                 self.model_path,
-                torch_dtype=torch.bfloat16,
-                device_map='cuda',
+                torch_dtype=load_dtype,
+                device_map=device_map if device_map != 'cuda' else 'cuda',
                 attn_implementation='sdpa'
             )
+
+        if self.device == 'mps':
+            self.model.to('mps')
+            torch.mps.synchronize()
+            print("Model moved to MPS device.")
         self.model.eval()
-        
+
         # Use SDE solver by default
         self.model.model.noise_scheduler = self.model.model.noise_scheduler.from_config(
-            self.model.model.noise_scheduler.config, 
+            self.model.model.noise_scheduler.config,
             algorithm_type='sde-dpmsolver++',
             beta_schedule='squaredcos_cap_v2'
         )
         self.model.set_ddpm_inference_steps(num_steps=self.inference_steps)
-        
+
         if hasattr(self.model.model, 'language_model'):
             print(f"Language model attention: {self.model.model.language_model.config._attn_implementation}")
     
@@ -1130,11 +1159,18 @@ def parse_args():
         default="/tmp/vibevoice-model",
         help="Path to the VibeVoice model directory",
     )
+    # Device selection with MPS detection
+    if torch.backends.mps.is_available():  # type: ignore[attr-defined]
+        default_device = 'mps'
+    elif torch.cuda.is_available():
+        default_device = 'cuda'
+    else:
+        default_device = 'cpu'
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device for inference",
+        default=default_device,
+        help="Device for inference (mps|cuda|cpu|auto)",
     )
     parser.add_argument(
         "--inference_steps",
