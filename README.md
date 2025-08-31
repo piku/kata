@@ -1,38 +1,53 @@
 # kata
 
-> Kata (型), meaning "form," "model," or "pattern." This aligns with the structured approach of systemd unit files, Dockerfiles/Quadlets for Podman, and Caddyfiles, representing the defined "forms" for deploying and managing applications
+> Kata (型) means *form / model / pattern*. This project provides a tiny “micro-PaaS” wrapper around Docker (Compose or Swarm) with optional HTTP routing via Caddy.
 
-# Requirements
+## What it does (current implementation)
 
-`kata` requires a system with `systemd`, `docker`, and `caddy` installed. It is designed to work with the following versions:
+* Parses an application `kata-compose.yaml` and generates a `.docker-compose.yaml` used for deployment
+* Supports either Docker Swarm (`docker stack deploy`) or Docker Compose (`docker compose up -d`) per app (auto‑selects, overridable)
+* Optionally configures Caddy via its Admin API using a top‑level `caddy:` section inside `kata-compose.yaml`
+* Builds lightweight runtime images on‑demand for `runtime: python` or `runtime: nodejs` services (images: `kata/python`, `kata/nodejs`)
+* Manages per‑app bind‑mounted directories (code, data, config, venv, logs, repos)
+* Merges environment variables from multiple sources and injects them into each service
+* Provides simple git push deployment hooks (`git-receive-pack` / `git-hook`)
+* Offers helper commands for secrets (Swarm only), mode switching, and Caddy inspection
 
-- `systemd`: 239 or later
-- `docker`: 20.10 or later
-- `caddy`: 2.4 or later
-- `podman-compose`: 1.0 or later
+## Requirements
 
-This means that Debian 13 (Trixie) or later is a requirement.
+Mandatory:
+
+* **Docker** 20.10+ (Swarm optional; if inactive, Compose mode is used)
+* **Python** 3.12+ (to run `kata.py`)
+
+Optional (only if you want HTTP routing):
+
+* **Caddy** 2.4+ with Admin API enabled (`admin localhost:2019`)
+
+> systemd / Podman are **not** required by the current code path (earlier design notes referenced them).
+
+Tested on Debian 12/13 and recent Ubuntu; any Linux with Docker + Caddy should work.
 
 ## Caddy Configuration
 
-Kata uses Caddy's API to configure routing and proxying for your applications. To customize how Caddy handles your application, add a `caddy:` section to your app's `kata-compose.yaml` at the application root directory.
+Add a **top-level `caddy:` key** inside `kata-compose.yaml`. Do **not** create a separate `caddy.json` file; the script extracts the object and injects it into the live Caddy config under `/apps/http/servers/<app>`.
 
-The `caddy:` section supports environment variable substitution. Variables like `$PORT`, `$BIND_ADDRESS`, or any other environment variable defined in your application's ENV file can be used in the configuration.
+Environment variables inside that section are expanded (shell style), using the merged per‑app environment.
 
-### How kata applies the `caddy:` section
+### How it’s applied
 
-- Add a top-level `caddy:` key in your `kata-compose.yaml`.
-- On deploy, kata:
-  - Loads the YAML and substitutes environment variables like `$PORT`, `$APP_ROOT`, etc.
-  - Validates the shape (must be a Caddy “server” object, not the full Caddy config)
-  - Writes your app’s server config into Caddy at path `/config/apps/http/servers/{app}`
-- On destroy, kata removes that server from Caddy while preserving any other servers.
+On deploy:
+1. `kata-compose.yaml` is loaded and variable substitution runs.
+2. The `caddy:` object (must represent a single **server** block) is merged into the existing Caddy config only at your app server key.
+3. Other servers remain untouched.
+
+On destroy: only your app’s server entry is removed.
 
 Important:
 
-- Your `caddy.json` must represent a single Caddy HTTP server object (fields like `listen`, `routes`, `tls_connection_policies`, …), not the global Caddy config.
-- The server name (ID) is the app name. Each app owns one server: `/apps/http/servers/<app>`.
-- Kata does not generate ports/hostnames/SSL; your `caddy.json` should define those (Caddy will handle TLS automatically when configured to do so).
+* Supply a **server object** (fields like `listen`, `routes`, `tls_connection_policies`, etc.). Not a full Caddy root config.
+* Server name == app name.
+* Kata does not invent hostnames / TLS settings—configure them yourself; Caddy auto‑enables HTTPS when host matchers use real domains.
 
 ### Environment variables available in the `caddy:` section
 
@@ -57,15 +72,18 @@ Below are ready-to-use examples you can adapt.
 
 ### Application Structure
 
-When you deploy an app with kata, it's organized as follows:
+Paths are rooted at `KATA_ROOT` (default: `$HOME`). The current directory names (note: singular `app/`) are:
 
-- **App Code**: `~/.kata/apps/your-app` - Your application's code is deployed here from your git repository
-- **Data Directory**: `~/.kata/data/your-app` - Persistent data storage that survives new deployments
-- **Environment Settings**: `~/.kata/envs/your-app/ENV` - Environment variables
-- **Logs**: `~/.kata/logs/your-app` - Log files for your application
-- **Cache**: `~/.kata/cache/your-app` - Cache storage
+* Code: `$KATA_ROOT/app/<app>`
+* Data: `$KATA_ROOT/data/<app>`
+* Config: `$KATA_ROOT/config/<app>` (place `ENV` or `.env` here to override variables)
+* Virtual env / runtime state: `$KATA_ROOT/envs/<app>`
+* Logs: `$KATA_ROOT/logs/<app>`
+* Git bare repos: `$KATA_ROOT/repos/<app>`
 
-Your application's Procfile, ENV file, and caddy.json should be placed in the app code directory (they are typically part of your git repository).
+There is presently **no** dedicated cache directory constant (earlier docs mentioned one).
+
+Generated file: `.docker-compose.yaml` inside the app code directory (regenerated each deploy).
 
 ## Sample `caddy:` sections for `kata-compose.yaml`
 
@@ -188,27 +206,26 @@ caddy:
 
 ### 4. Advanced Configuration (Static Assets with Cache)
 
-Serve a web application with static assets and caching:
+Serve versioned/static assets under `/static/*` with caching + proxy everything else:
 
 ```yaml
 caddy:
   listen:
     - ":$PORT"
   routes:
+    # Static assets (cacheable)
     - match:
-        - host: ["$DOMAIN_NAME"]
+        - path: ["/static/*"]
       handle:
-        - handler: vars
-          root: "$APP_ROOT/static"
         - handler: file_server
-          match:
-            - path: ["/static/*"]
-          root: "{http.vars.root}"
+          root: "$APP_ROOT/static"
           index_names: ["index.html"]
           headers:
             response:
               set:
                 Cache-Control: ["public, max-age=3600"]
+    # Everything else -> upstream app
+    - handle:
         - handler: reverse_proxy
           upstreams:
             - dial: "$BIND_ADDRESS:$PORT"
@@ -243,44 +260,50 @@ caddy:
     - match:
         - path: ["/admin/*"]
       handle:
-        - handler: basicauth
-          hash: { algorithm: bcrypt }
-          accounts:
-            - username: "$ADMIN_USER"
-              password: "$ADMIN_PASS_HASH"
+        # Basic HTTP auth (bcrypt-hashed password)
+        - handler: authentication
+          providers:
+            http_basic:
+              accounts:
+                - username: "$ADMIN_USER"
+                  password: "$ADMIN_PASS_HASH"  # bcrypt hash
         - handler: reverse_proxy
           upstreams:
             - dial: "$BIND_ADDRESS:$PORT"
 ```
 
-Note: For `basicauth`, use a pre-hashed password (bcrypt). You can generate one with `caddy hash-password --algorithm bcrypt`.
+Generate a bcrypt hash with: `caddy hash-password --algorithm bcrypt --plaintext 'secret'`.
 
 ## Environment Variables
 
-Make sure to set these key environment variables in your application's ENV file:
+Merged from (later sources override earlier):
+1. Base: `PUID`, `PGID`, and per‑app root paths (`APP_ROOT`, `DATA_ROOT`, `ENV_ROOT`, `CONFIG_ROOT`, `GIT_ROOT`, `LOG_ROOT`)
+2. Top‑level `environment:` mapping in `kata-compose.yaml` (optional)
+3. `ENV` or `.env` file in the app’s config directory
+4. Service‑level `environment` entries
 
-- `PORT`: Required. The port your application listens on.
-- `BIND_ADDRESS`: The address to bind to (defaults to 127.0.0.1).
-- `DOMAIN_NAME`: For HTTPS configurations, set this to your domain name.
+Compose list form (`["KEY=VALUE", "BARE_KEY"]`) is normalized; bare keys default to empty string.
 
-You can also use these kata-specific variables in your caddy.json:
+Recommended to set:
+* `PORT` (service listen port, especially for reverse proxying)
+* `BIND_ADDRESS` (default `127.0.0.1` if omitted in your own config logic)
+* `DOMAIN_NAME` (for host matchers / TLS)
 
-- `$APP_ROOT`: App directory path (typically ~/.kata/apps/your-app) - use for files in your git repository
-- `$DATA_ROOT`: App data directory (typically ~/.kata/data/your-app) - use for persistent data that survives deployments
-- `$LOG_ROOT`: Log directory (typically ~/.kata/logs/your-app)
-- `$CACHE_ROOT`: Cache directory (typically ~/.kata/cache/your-app)
+Automatically injected into each service unless already set: the base variables above.
 
-For more detailed Caddy configurations, refer to the [Caddy JSON documentation](https://caddyserver.com/docs/json/).
+For more details on Caddy JSON, see the [Caddy docs](https://caddyserver.com/docs/json/).
 
 ### Caddy API Integration
 
-Kata interacts with Caddy through its admin API, which by default runs on `localhost:2019`. When you deploy an app, if a `caddy.json` file is present:
+Kata talks to the Caddy Admin API at `localhost:2019`:
 
-1. The file is loaded and environment variables are expanded
-2. The configuration is sent to Caddy's API endpoint at `/config/apps/http/servers/your-app`
-3. When an app is destroyed, its configuration is removed via the API
+1. Extracts the `caddy:` server object from `kata-compose.yaml`
+2. Expands variables
+3. Reads current full config, updates only `/apps/http/servers/<app>`
+4. POSTs the updated full config to `/load`
+5. On removal, deletes that server entry and reposts
 
-Make sure Caddy is running with its admin API enabled. The default configuration in kata assumes Caddy is started with:
+Ensure Caddy runs with:
 
 ```caddyfile
 {
@@ -310,45 +333,89 @@ curl -s http://localhost:2019/config | jq '.'
 
 ## Compose vs Swarm Modes
 
-Kata can deploy either with Docker Compose (single-host) or Docker Swarm (stack deploy):
+Default per host state:
+* Swarm active → deploy via `docker stack deploy`
+* Swarm inactive → deploy via `docker compose up -d`
 
-- If Swarm is active on the host (`docker swarm init` done), kata uses Swarm by default
-- If Swarm is not active, kata uses Compose by default
-
-You can force the mode per app in `kata-compose.yaml`:
+Override per app:
 
 ```yaml
-x-kata-mode: compose  # or 'swarm'
+x-kata-mode: compose   # or swarm
 ```
 
-Or switch it via CLI:
+Or with CLI:
 
 ```bash
-# Show current mode
-kata mode <app>
-
-# Set to compose (and restart the app)
-kata mode <app> compose
-
-# Set to swarm (requires 'docker swarm init' on the host)
+kata mode <app>          # show
+kata mode <app> compose  # set & restart
 kata mode <app> swarm
 ```
 
-Notes:
+Helper file `.kata-mode` in the app root persists the selection.
 
-- Compose mode uses `docker compose up -d` (falls back to `docker-compose` if needed)
-- Swarm mode uses `docker stack deploy ... --prune`
-- Keep your `kata-compose.yaml` compatible with your chosen mode (Swarm ignores some Compose-only features and vice versa)
+### Runtime Images
 
-### Secrets
+If a service defines:
 
-Docker secrets are a Swarm-only feature. The following commands require Swarm:
+```yaml
+services:
+  web:
+    runtime: python  # or nodejs
+    command: ["python", "-m", "app"]
+```
+
+Kata will build (once) or reuse a `kata/<runtime>` image from an internal Dockerfile, bind‑mount app/config/data/venv, and (for Python) create a venv + install `requirements.txt`.
+
+If you supply `image:` yourself, no runtime automation runs.
+
+### Secrets (Swarm only)
+
+Commands:
 
 ```bash
-kata secrets:set NAME=VALUE      # or NAME=@file, NAME=- (stdin), or just NAME (prompt)
+kata secrets:set NAME=VALUE   # NAME=@file, NAME=- (stdin), or just NAME (prompt)
 kata secrets:ls
 kata secrets:rm NAME
 ```
 
-If Swarm isn’t active, these commands will error with a helpful message.
+They are disabled (with a warning) when Swarm is inactive.
+
+### Git Deployment
+
+Two internal commands (`git-receive-pack` / `git-upload-pack`) plus the `git-hook` are used when you push to a bare repo under `$KATA_ROOT/repos/<app>`. The post‑receive hook triggers `git-hook` which runs `do_deploy`.
+
+You can also manually trigger deployment by piping a synthetic ref update:
+
+```bash
+echo "0000000000000000000000000000000000000000 $(git rev-parse HEAD) refs/heads/main" | kata git-hook <app>
+```
+
+### CLI Overview
+
+Selected commands (run `kata help` for full output):
+
+| Command | Purpose |
+|---------|---------|
+| setup | Create root directories |
+| ls | List apps & running state |
+| restart / stop / rm | Lifecycle management |
+| mode | Get/set deploy mode |
+| config:stack | Show original `kata-compose.yaml` |
+| config:docker | Show generated `.docker-compose.yaml` |
+| config:caddy | Show live Caddy server JSON |
+| secrets:* | Manage Swarm secrets |
+| docker ... | Passthrough to `docker` |
+| docker:services / ps | Inspect Swarm/Compose processes |
+| run <service> <cmd...> | Exec into a running container |
+| update | (WIP) self‑update script |
+
+> `update` currently attempts a raw download; harden before production use.
+
+## Examples
+
+See `docs/examples/minimal-python/` for a small FastAPI app using the Python runtime.
+
+---
+
+Feedback / issues welcome. This README tracks the **current code** in `kata.py`; if something here is missing in code, file a bug.
 

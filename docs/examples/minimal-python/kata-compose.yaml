@@ -1,0 +1,27 @@
+# Minimal Python example for Kata
+# - Runs a FastAPI app with Uvicorn
+# - Publishes on 127.0.0.1:8000 for host Caddy to proxy to
+# - Caddy is configured to proxy http(s)://localhost -> 127.0.0.1:8000
+# - Force compose mode so the 127.0.0.1 host binding works even if Swarm is active
+
+x-kata-mode: compose
+
+environment:
+  PORT: "8000"
+  BIND_ADDRESS: "127.0.0.1"
+  DOMAIN_NAME: "localhost"
+
+services:
+  web:
+    runtime: python
+    command: uvicorn app:app --host 0.0.0.0 --port $PORT
+    ports:
+      - "127.0.0.1:$PORT:$PORT"
+
+caddy:
+  listen: [":80", ":443"]
+  routes:
+    - match: [{host: ["$DOMAIN_NAME"]}]
+      handle:
+        - handler: reverse_proxy
+          upstreams: [{dial: "$BIND_ADDRESS:$PORT"}]

@@ -75,27 +75,29 @@ Notes:
 - Volumes are auto-bound to `/app`, `/config`, `/data`, `/venv` unless you override.
 - If you set `runtime: python` or `runtime: nodejs` on a service and omit `image:`, Kata builds a tiny base image and prepares `/venv` or npm install accordingly.
 
-Minimal example:
+Minimal example (forced compose mode for loopback bind):
 
 ```yaml
 # kata-compose.yaml
+x-kata-mode: compose
 environment:
   PORT: 8000
+  DOMAIN_NAME: localhost
 
 services:
   web:
     runtime: python
     command: uvicorn main:app --host 0.0.0.0 --port $PORT
     ports:
-      - "$PORT"
+      - "127.0.0.1:$PORT:$PORT"
 
 caddy:
   listen: [":80", ":443"]
   routes:
-    - match: [{host: ["example.com"]}]
+    - match: [{host: ["$DOMAIN_NAME"]}]
       handle:
         - handler: reverse_proxy
-          upstreams: [{dial: "web:8000"}]
+          upstreams: [{dial: "$BIND_ADDRESS:$PORT"}]
 ```
 
 For many more Caddy configuration examples, see the Caddy section in `README.md`.
@@ -133,6 +135,12 @@ Option B: Manual work tree
 
 After deployment, Kata writes a generated Compose file to `APP_ROOT/APP/.docker-compose.yaml`.
 
+Redeploy shortcut (already checked out):
+
+```bash
+kata restart APP
+```
+
 ## Command reference
 
 - ls — list deployed apps (asterisk indicates running)
@@ -161,10 +169,17 @@ Notes:
 
 ## Logs and troubleshooting
 
-- Use `docker logs` or `docker compose logs` for service-level logs.
-- For Swarm services, `docker service ps SERVICE` and `docker logs CONTAINER` are helpful.
-- If Caddy routing doesn’t work, verify the Admin API is reachable and that `config:caddy` shows your server.
-- If secrets fail, ensure Swarm is initialized (`docker swarm init`) or switch mode to `compose` if you don’t need secrets.
+Log access (no built-in aggregation yet):
+
+* Compose mode: `docker compose -f APP_ROOT/APP/.docker-compose.yaml logs -f`
+* Swarm: `docker service ps APP_web` then `docker logs <container>`
+* Generic: `kata docker logs <container>` (pass-through)
+
+Common issues:
+* Caddy config missing: Confirm top-level `caddy:` exists and `kata config:caddy APP` returns JSON
+* Port not reachable: Check mode (Swarm may not honor 127.0.0.1 binds); force compose with `kata mode APP compose`
+* Secrets error: Initialize Swarm or avoid secrets commands
+* Runtime install problems: Ensure `requirements.txt` (Python) or `package.json` (Node) exists; inspect image build output
 
 ## Environment variables available to your services
 
@@ -174,6 +189,8 @@ Kata provides these standard variables to each service unless you override them:
 - APP_ROOT, DATA_ROOT, CONFIG_ROOT, ENV_ROOT, GIT_ROOT, LOG_ROOT (app-specific paths)
 
 You can reference them in `kata-compose.yaml` or your service commands, e.g., `$APP_ROOT`, `$DATA_ROOT`, `$PORT`.
+
+Merge order (later overrides earlier): base → top-level `environment:` → `ENV` / `.env` → service env.
 
 ## Uninstalling an app
 
@@ -186,7 +203,27 @@ You can reference them in `kata-compose.yaml` or your service commands, e.g., `$
 - In `compose` mode, Docker secrets aren’t available; prefer environment variables or config files.
 - In `swarm` mode, bind mounts are still used for app/data/config/venv paths by default.
 
+Advanced Caddy example (static + proxy):
+
+```yaml
+caddy:
+  listen: [":80"]
+  routes:
+    - match: [{path: ["/static/*"]}]
+      handle:
+        - handler: file_server
+          root: "$APP_ROOT/static"
+          headers:
+            response:
+              set:
+                Cache-Control: ["public, max-age=3600"]
+    - handle:
+        - handler: reverse_proxy
+          upstreams: [{dial: "$BIND_ADDRESS:$PORT"}]
+```
+
 ## Where next
 
-- See `README.md` for a deep dive on Caddy configuration with more examples.
-- Explore your generated Compose file at `APP_ROOT/APP/.docker-compose.yaml` to see what Kata produced.
+* See `README.md` for extended Caddy examples & advanced scenarios
+* Browse `docs/SPEC-revised.md` for current capabilities & roadmap
+* Inspect generated Compose: `APP_ROOT/APP/.docker-compose.yaml`

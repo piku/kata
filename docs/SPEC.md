@@ -1,561 +1,470 @@
-# Piku: Micro-PaaS Specification
+# Kata: Current Implementation Specification
+
+> This document reflects **what `kata.py` implements today**. Earlier design goals (systemd units, Podman quadlets, richer schema) are not yet present; they appear below under “Planned / Roadmap”.
 
 ## Overview
 
-Piku is a lightweight Platform as a Service (PaaS) implementation designed for small-scale deployments on a single server. It provides a Heroku-like experience with git-based deployments, process management, and support for multiple programming languages and frameworks.
+Kata is a single‑file micro-PaaS that deploys applications from git pushes (or manual triggers) onto Docker using either **Swarm stacks** or **Compose** and (optionally) configures **Caddy** for HTTP(S) routing via its Admin API. It provides a minimal opinionated layer: parse a `kata-compose.yaml`, generate a `.docker-compose.yaml`, ensure runtime images, deploy, and optionally register a Caddy server block.
 
-## Core Architecture
+Key properties:
+* Single Python 3.12+ script (`kata.py`), no external DB
+* Uses bind‑mounted host directories instead of named volumes (unless supplied by user)
+* Lightweight runtime image bootstrap for Python / NodeJS when `runtime:` is declared per service
+* Deterministic environment merging with per‑service overrides
+* Optional Caddy server configuration injection (add / remove only your app’s server)
+* Git push deployment via internal `git-*` commands and forced authorized_keys commands
+
+Non‑goals (current state): process scaling beyond Docker primitives, declarative build phases, systemd or Podman orchestration, multi-node scheduling beyond Swarm’s native behavior, advanced TLS/cloud provider automation.
+
+## Core Architecture (Implemented)
 
 ### Components
 
-1. **Git-based deployment system**
-   - Uses git hooks to trigger deployments
-   - Supports standard git workflows (push to deploy)
+1. **Git-based deployment**
+   * Bare repo under `$KATA_ROOT/repos/<app>`
+   * `post-receive` hook invokes `kata.py git-hook <app>`
+   * Hook triggers `do_deploy()` which refreshes working tree and regenerates config
+2. **Container orchestration**
+   * Docker Swarm (`docker stack deploy`) if Swarm active, else Docker Compose (`docker compose up -d`)
+   * Per‑app mode selectable (`kata mode <app> [compose|swarm]` or `x-kata-mode:` key)
+3. **Runtime images**
+   * On-demand build of `kata/python` or `kata/nodejs` when a service defines `runtime: python|nodejs`
+   * Injects volumes: app, config, data, venv
+   * Python runtime creates venv and installs `requirements.txt` if present
+4. **Environment merging**
+   * Base (paths + PUID/PGID) → top-level `environment:` → config file `ENV` / `.env` → service environment (list or mapping) with service keys winning
+5. **Caddy integration**
+   * Optional top-level `caddy:` server object injected into existing Caddy configuration at `/apps/http/servers/<app>` via Admin API
+   * Removal cleans only that server entry
+6. **Secrets (Swarm only)**
+   * Simple passthrough to `docker secret` commands (`secrets:set|ls|rm`) gated by Swarm detection
 
-2. **Process Management**
-   - Uses uWSGI Emperor for process supervision
-   - Supports multiple process types defined in Procfile
-   - Manages worker processes and scales them as needed
+## Configuration Format (kata-compose.yaml)
 
-3. **Web Server Integration**
-   - Nginx configuration generation and management
-   - SSL/TLS support with automatic certificate management via acme.sh
-   - Static file serving and proxy configuration
+`kata-compose.yaml` is a **Compose-like** YAML. Kata reads a subset sufficient to:
+* Determine services and their runtime/image/command/ports/volumes/environment
+* Optionally capture a `caddy:` server object (NOT full Caddy root config)
+* Optionally set deployment mode via `x-kata-mode: compose|swarm`
 
-4. **Runtime Environment Management**
-   - Language-specific virtual environments
-   - Environment variable management
-   - Support for multiple programming languages/frameworks
+Unsupported (currently ignored) top-level keys from earlier design: `version`, `build`, `app`, `networks`, `volumes` (unless user supplies explicit volumes mapping which is passed through), custom scaling fields (`instances`), scheduled tasks, CloudFlare settings.
 
-## Directory Structure
+### Minimal Structure Example
 
-Piku organizes its files in the following directory structure under `$HOME/.piku`:
+```yaml
+environment:
+  PORT: "8000"
+  DOMAIN_NAME: "example.test"
 
-- `apps/` - Application code
-- `data/` - Persistent data for applications
-- `envs/` - Virtual environments for applications
-- `repos/` - Git repositories
-- `logs/` - Application logs
-- `nginx/` - Nginx configuration files
-- `cache/` - Cache files for applications
-- `uwsgi-available/` - Available uWSGI configurations
-- `uwsgi-enabled/` - Enabled uWSGI configurations
-- `uwsgi/` - uWSGI runtime files
-- `acme/` - ACME challenge files for SSL certificates
-- `plugins/` - Piku plugins
+services:
+  web:
+    runtime: python
+    command: uvicorn app:app --host 0.0.0.0 --port $PORT
+    ports:
+      - "127.0.0.1:$PORT:$PORT"  # Compose mode or single-host use
 
-## Supported Runtimes
+caddy:
+  listen: [":80", ":443"]
+  routes:
+    - match: [{ host: ["$DOMAIN_NAME"] }]
+      handle:
+        - handler: reverse_proxy
+          upstreams: [{ dial: "127.0.0.1:$PORT" }]
 
-Piku detects and supports the following application types:
+x-kata-mode: compose  # optional override
+```
+
+### Service Runtime Selection
+Provide either:
+* `runtime: python|nodejs` (Kata supplies `image:` and mounts) OR
+* Explicit `image: repo/name:tag` (no runtime bootstrap performed)
+
+### Environment Forms
+Service `environment:` may be:
+* Mapping (`KEY: value`)
+* List (`["KEY=VALUE", "BARE_KEY"]`) — normalized; bare keys default to empty string
+
+## Directory Structure (Current)
+
+Kata organizes files under `$KATA_ROOT` (default `$HOME`):
+
+| Path | Purpose |
+|------|---------|
+| `app/<app>` | Working tree (checked out code) |
+| `data/<app>` | Persistent data (bind mounted as `data`) |
+| `config/<app>` | Config overrides (`ENV` / `.env`) |
+| `envs/<app>` | Virtual env / runtime state (`/venv` mount) |
+| `logs/<app>` | (Reserved for future log handling; not actively written by kata.py) |
+| `repos/<app>` | Bare git repo (push target) |
+
+Generated per deployment: `app/<app>/.docker-compose.yaml`
+
+## Supported Runtimes (Implemented)
+
+Currently implemented:
 
 1. **Python**
-   - Standard virtualenv with requirements.txt
-   - Poetry support with pyproject.toml
-   - uv support with pyproject.toml
+   * Debian slim base, installs python3 + venv + pip
+   * Creates `/venv`, installs `requirements.txt` if present
+2. **NodeJS**
+   * Debian slim base, installs node+npm+yarn, runs `npm install`
 
-2. **Ruby**
-   - Bundler support via Gemfile
+Planned (not yet): Go, Rust, generic container build orchestration, static site shortcuts.
 
-3. **Node.js**
-   - npm/package.json support
-   - Custom package managers via NODE_PACKAGE_MANAGER env var
+## `kata-compose.yaml` Reference (Subset)
 
-4. **Java**
-   - Maven support (pom.xml)
-   - Gradle support (build.gradle)
+### Top-level `environment:`
 
-5. **Go**
-   - Golang support (Godeps, go.mod)
-
-6. **Clojure**
-   - Leiningen support (project.clj)
-   - Clojure CLI support (deps.edn)
-
-7. **Rust**
-   - Cargo support (Cargo.toml, rust-toolchain.toml)
-
-8. **PHP**
-   - PHP application support via uwsgi_php plugin
-
-9. **Generic**
-   - Support for any application with a Procfile
-
-## Runtime Detection and Deployment
-
-Piku uses a cascading detection system to identify application types:
-
-1. **Detection Order:**
-   - First checks for language-specific files (requirements.txt, package.json, etc.)
-   - Falls back to worker types in Procfile (php, web, static, etc.)
-   - Each detection adds environment variables specific to that runtime
-
-2. **Detection Mechanism:**
-   - Python: Checks for `requirements.txt` or `pyproject.toml`
-   - Ruby: Checks for `Gemfile`
-   - Node.js: Checks for `package.json`
-   - Java Maven: Checks for `pom.xml`
-   - Java Gradle: Checks for `build.gradle`
-   - Go: Checks for `Godeps`, `go.mod` or any `*.go` files
-   - Clojure: Checks for `deps.edn` (CLI) or `project.clj` (Leiningen)
-   - Rust: Checks for `Cargo.toml` AND `rust-toolchain.toml`
-   - PHP: Identified by the presence of a `php` worker type in Procfile
-   - Generic: Identified by presence of both `web` and `release` workers
-   - Static: Identified by presence of a `static` worker in Procfile
-
-3. **Priority Rules:**
-   - WSGI applications (wsgi, jwsgi, rwsgi) take precedence over web workers
-   - If both are found, web worker is automatically disabled
-
-## Configuration
-
-### Environment Variables
-
-Piku uses the following files for configuration:
-
-- `ENV` file in the application root for default settings
-- `ENV` file in the environment directory for customized settings
-- `LIVE_ENV` file generated during deployment for runtime settings
-
-### Scaling Configuration
-
-- `SCALING` file in the environment directory for process scaling
-
-### Application Process Types
-
-Applications define their process types in a `Procfile` with the following format:
-
-```
-<process_type>: <command>
+```yaml
+environment:
+  KEY: value
+  PORT: 8000
 ```
 
-Special process types:
-
-- `web`: HTTP service (port will be automatically assigned)
-- `wsgi`: Python WSGI application
-- `jwsgi`: Java WSGI application
-- `rwsgi`: Ruby WSGI application
-- `static`: Static file server
-- `php`: PHP application
-- `cron-*`: Scheduled tasks
-- `release`: Commands run at release time
-- `preflight`: Commands run before deployment
-
-## Worker Process Types and Handling
-
-Piku supports several specialized worker types, each handled differently:
-
-- `web`: Runs as an attach-daemon under uWSGI, proxied via Nginx
-- `wsgi`: Python WSGI application run directly by uWSGI
-  - For Python 2: Uses the 'python' plugin
-  - For Python 3: Uses the 'python3' plugin
-  - Supports gevent (Python 2) or asyncio (Python 2/3) for async operations
-- `jwsgi`: Java WSGI application with 'jvm' and 'jwsgi' plugins
-- `rwsgi`: Ruby WSGI application with 'rack', 'rbrequire', and 'post-buffering' plugins
-- `php`: PHP application via uwsgi_php plugin
-- `static`: Static file server via Nginx only (no uWSGI process)
-- `cron-*`: Scheduled tasks using uWSGI's built-in cron functionality
-- Regular workers: Run as attach-daemon processes under uWSGI
-
-Worker scaling is controlled through the SCALING file, which maps process types to instance counts.
-
-## Nginx Configuration
-
-Piku automatically generates Nginx configuration based on environment variables:
-
-- `NGINX_SERVER_NAME`: Hostname(s) for the application (comma-separated values)
-- `NGINX_STATIC_PATHS`: Static file mappings in format `/prefix1:path1,/prefix2:path2`
-- `NGINX_HTTPS_ONLY`: Force HTTPS (true/false)
-- `NGINX_CACHE_PREFIXES`: URL paths to cache in format `prefix1|prefix2|prefix3`
-- `NGINX_CACHE_SIZE`: Cache size in gigabytes (default: 1)
-- `NGINX_CACHE_TIME`: Cache duration for content in seconds (default: 3600)
-- `NGINX_CACHE_CONTROL`: Cache control header timeout in seconds (default: 3600)
-- `NGINX_CACHE_REDIRECTS`: Cache duration for redirects in seconds (default: 3600)
-- `NGINX_CACHE_ANY`: Cache duration for other responses in seconds (default: 3600)
-- `NGINX_CACHE_EXPIRY`: Cache expiry time in seconds (default: 86400)
-- `NGINX_CACHE_PATH`: Custom cache directory path (defaults to `$HOME/.piku/cache/<app>`)
-- `NGINX_CLOUDFLARE_ACL`: Restrict access to CloudFlare IP addresses (true/false)
-- `NGINX_ALLOW_GIT_FOLDERS`: Allow access to .git folders (true/false)
-- `NGINX_INCLUDE_FILE`: Custom Nginx config include file path
-- `NGINX_IPV4_ADDRESS`: IPv4 bind address (defaults to 0.0.0.0)
-- `NGINX_IPV6_ADDRESS`: IPv6 bind address (defaults to [::])
-- `NGINX_CATCH_ALL`: Catch-all URL for static paths
-- `DISABLE_IPV6`: Disable IPv6 support (true/false)
-
-## SSL/TLS Certificate Management
-
-Piku manages SSL/TLS certificates through the following process:
-
-1. When `NGINX_SERVER_NAME` is set, Piku attempts to secure the app with HTTPS
-2. It first checks for an existing certificate in the ACME_ROOT directory
-3. If acme.sh is installed, it tries to obtain certificates from Let's Encrypt:
-   - Creates a temporary Nginx config to serve the ACME challenge
-   - Uses acme.sh to request certificates for all domains in NGINX_SERVER_NAME
-   - Installs certificates to the Nginx directory
-4. If certificate acquisition fails or acme.sh isn't available, it generates a self-signed certificate
-5. For HTTPS-only mode (`NGINX_HTTPS_ONLY=true`), all HTTP requests are redirected to HTTPS
-
-The system supports HTTP/2 if Nginx was compiled with that module, or SPDY as fallback.
-
-## CloudFlare Integration
-
-When `NGINX_CLOUDFLARE_ACL` is set to true, Piku:
-
-1. Retrieves the official CloudFlare IP ranges from their API
-2. Configures Nginx to allow access only from those IP addresses
-3. Additionally allows access from the client's IP address at deploy time
-4. Sets up Nginx to recognize the `CF-Connecting-IP` header for proper IP logging
-5. Blocks all other traffic with `deny all` directive
-
-This provides an additional layer of security by ensuring that traffic only comes through CloudFlare's network.
-
-## Static File Optimization
-
-For static file serving, Piku configures Nginx with optimized settings:
-
-- Enables `sendfile` for efficient file serving
-- Sets `sendfile_max_chunk` to 1MB to optimize throughput
-- Enables TCP NOPUSH for reducing packet count
-- Configures `directio` (8MB) and `aio threads` for improved I/O performance
-- Implements `try_files` with fallback to catch-all URLs where configured
-
-If a `static` worker is defined in the Procfile, its path is automatically added to the static mappings.
-
-## uWSGI Configuration
-
-uWSGI settings can be customized via environment variables:
-
-- `UWSGI_PROCESSES`: Number of processes (default: 1)
-- `UWSGI_THREADS`: Number of threads (default: 4 for WSGI processes)
-- `UWSGI_LISTEN`: Listen queue size (default: 16)
-- `UWSGI_MAX_REQUESTS`: Maximum requests per worker (default: 1024)
-- `UWSGI_IDLE`: Idle timeout for workers (enables on-demand workers with "cheap" and "die-on-idle" options)
-- `UWSGI_GEVENT`: Enable gevent for Python 2 applications
-- `UWSGI_ASYNCIO`: Enable asyncio for Python applications (specify number of async tasks)
-- `UWSGI_ENABLE_THREADS`: Enable threads support (true/false, default: true)
-- `UWSGI_LOG_X_FORWARDED_FOR`: Log X-Forwarded-For header (true/false, default: false)
-- `UWSGI_LOG_MAXSIZE`: Maximum log file size (default: 1048576 bytes)
-- `UWSGI_INCLUDE_FILE`: Custom uWSGI config include file
-
-## PHP Configuration
-
-For PHP applications, Piku configures uWSGI with the following settings:
-
-- Uses the `http` and `php` plugins
-- Automatically configures document root based on the Procfile's `php` command path
-- Sets up static file handling with `check-static` and appropriate skip extensions
-- Configures PHP specific settings:
-  - `php-docroot`: Document root directory for PHP files
-  - `php-allowed-ext`: File extensions allowed to be processed by PHP (default: `.php`)
-  - `php-index`: Default index file (default: `index.php`)
-  - `static-index`: Default static index file (default: `index.html`)
-  - `static-skip-ext`: File extensions to skip for static serving (`.php`, `.inc`)
-
-PHP applications are detected when a `php` worker is defined in the Procfile.
-
-## Socket Handling
-
-Piku automatically manages socket connections between Nginx and uWSGI:
-
-1. For WSGI applications (Python, Java, Ruby):
-   - When `NGINX_SERVER_NAME` is set, communication happens via Unix sockets:
-     - Socket file is created at `$HOME/.piku/nginx/<app>.sock`
-     - Socket permissions are set to 664 for proper access
-     - Nginx is configured to use `uwsgi_pass` to the Unix socket
-   - Without `NGINX_SERVER_NAME`, uWSGI binds to TCP port:
-     - Uses `http`, `http-use-socket`, and `http-socket` directives
-     - Binds to the address specified by `BIND_ADDRESS` (defaults to 127.0.0.1)
+### Services Section
+
+Compose-like structure. Kata uses only a subset:
+
+```yaml
+services:
+  service_name:
+    runtime: python            # OR image: repo/name:tag
+    command: your start cmd
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:                   # optional custom mapping
+      - app:/app               # if omitted Kata injects default named bind volumes
+    environment:               # optional, list or mapping
+      KEY: value
+```
+
+### Caddy Section (Server Object Only)
+
+Provide a single **server object** (NOT full root config):
+
+```yaml
+caddy:
+  listen: [":80", ":443"]
+  routes:
+    - match:
+        - host: ["example.com"]
+      handle:
+        - handler: reverse_proxy
+          upstreams:
+            - dial: "service_name:8000"
+  automatic_https:
+    disable: false
+```
+
+### Automatic Volume Binding
+If the top-level YAML lacks a `volumes:` mapping, Kata creates one with four bind mounts (`app`, `config`, `data`, `venv`) pointing to host paths. A service without explicit `volumes:` gets default shorthand mounts (`app:/app`, etc.).
+
+## Caddy Integration (Implemented Path)
+
+1. Load YAML, expand env vars
+2. Extract `caddy:` server object (validate minimal structure: list types etc.)
+3. GET current full Caddy config (`/config/`)
+4. Insert/replace `apps.http.servers[app]` with provided object; POST to `/load`
+5. On removal, delete that key and POST updated config
+
+No automatic derivation of routes, TLS policies, or redirects is performed; you supply them.
+
+## Environment Merging Rules
+
+Order of precedence (last wins):
+1. Base variables (PUID, PGID, path constants per app)
+2. Top-level `environment:` in `kata-compose.yaml`
+3. `ENV` or `.env` file inside `config/<app>`
+4. Service-level environment entries
+
+During service normalization:
+* List form is converted to a mapping
+* Base variables are added only if not already defined by the service
+
+## Git / SSH Flow
+
+* Authorized public keys appended with forced command referencing `kata.py`
+* `git-receive-pack` / `git-upload-pack` are passthrough commands used internally
+* After push, `git-hook` receives refs and triggers `do_deploy`
+
+## CLI (Implemented Commands)
+
+| Command | Summary |
+|---------|---------|
+| setup | Create root directory skeleton |
+| ls | List apps (mark running) |
+| config:stack <app> | Show original `kata-compose.yaml` |
+| config:docker <app> | Show generated `.docker-compose.yaml` |
+| config:caddy <app> | Show Caddy server JSON for app |
+| restart / stop / rm <app> | Lifecycle operations |
+| mode <app> [mode] | Get/set deployment mode |
+| secrets:set/ls/rm | Manage Swarm secrets (Swarm only) |
+| docker ... | Passthrough to `docker` |
+| docker:services <stack> | List services in a stack |
+| ps <service...> | Show tasks for a service (Swarm) |
+| run <service> <cmd...> | Exec inside a container |
+| setup:ssh <pubkey> | Register SSH key (forced command) |
+| update | Attempt self-update from upstream source |
+
+Not implemented (earlier spec): deploy, logs, config:set/unset, validate, migrate, scaling flags, schedule.
+
+## Deployment Sequence (Actual)
+
+1. Git push triggers `git-hook`
+2. Update working tree (`git fetch/reset/submodule update`)
+3. Parse `kata-compose.yaml` → merge env → build runtime image if needed → write `.docker-compose.yaml`
+4. Inject Caddy server (if provided)
+5. Deploy via Swarm or Compose (mode logic)
+
+## Security (Current)
+
+* SSH key forced-command restrictions
+* Docker isolation only (no systemd sandboxing / Podman yet)
+* Caddy TLS automation only if your server object config triggers it (standard Caddy behavior)
+
+## Logging (Current)
+
+* Kata itself prints to stdout / stderr
+* Container logs accessible via `docker` / `kata docker ...` commands (no integrated log aggregation)
+
+## Examples
+
+### Simple Python Web Application Without Caddy
+```yaml
+version: "1.0"
+
+app:
+  name: flask-app
+  runtime: python
+
+environment:
+  FLASK_ENV: production
+  PORT: 8000
+
+build:
+  commands:
+    - pip install -r requirements.txt
+
+services:
+  web:
+    command: gunicorn app:app --bind 0.0.0.0:$PORT
+    restart: always
+```
+
+### Simple Python Web Application with Caddy
+```yaml
+version: "1.0"
+
+app:
+  name: flask-app
+  runtime: python
+
+environment:
+  FLASK_ENV: production
+  PORT: 8000
+
+build:
+  commands:
+    - pip install -r requirements.txt
+
+services:
+  web:
+    command: gunicorn app:app --bind 127.0.0.1:$PORT
+    restart: always
+
+caddy:
+  routes:
+    - match:
+        - host: ["flask.example.com"]
+      handle:
+        - handler: reverse_proxy
+          upstreams:
+            - dial: ":$PORT"
+  https:
+    enabled: true
+    redirect: true
+    domains: ["flask.example.com"]
+```
+
+### Multi-Service Microservices Application
+```yaml
+version: "1.0"
+
+app:
+  name: microservices-app
+
+environment:
+  DATABASE_URL: postgresql://user:pass@db:5432/app
+  REDIS_URL: redis://redis:6379
+
+services:
+  web:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - "./nginx.conf:/etc/nginx/nginx.conf"
+    depends_on:
+      - api
+
+  api:
+    command: node server.js
+    instances: 3
+    environment:
+      NODE_ENV: production
+    healthcheck:
+      path: /api/health
+    depends_on:
+      - db
+      - redis
+
+  db:
+    image: postgres:15
+    volumes:
+      - "db_data:/var/lib/postgresql/data"
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+
+  redis:
+    image: redis:7-alpine
+
+  worker:
+    command: node worker.js
+    instances: 2
+    depends_on:
+      - redis
+      - db
+
+volumes:
+  db_data:
+
+caddy:
+  routes:
+    - match:
+        - host: ["api.example.com"]
+      handle:
+        - handler: reverse_proxy
+          upstreams:
+            - dial: "api:3000"
+    - match:
+        - host: ["example.com"]
+      handle:
+        - handler: reverse_proxy
+          upstreams:
+            - dial: "web:80"
+  https:
+    enabled: true
+    domains: ["example.com", "api.example.com"]
+```
+
+### Static Site with Build Process
+```yaml
+version: "1.0"
+
+app:
+  name: static-site
+  runtime: static
+
+build:
+  commands:
+    - npm install
+    - npm run build
+
+services:
+  static:
+    type: static
+    root: ./dist
+
+caddy:
+  routes:
+    - match:
+        - host: ["example.com"]
+      handle:
+        - handler: vars
+          root: "$HOST_APP_ROOT/dist"
+        - handler: file_server
+          match:
+            - path: ["/assets/*"]
+          root: "{http.vars.root}"
+          headers:
+            response:
+              set:
+                Cache-Control: ["public, max-age=31536000"]
+        - handler: file_server
+          root: "{http.vars.root}"
+          index_names: ["index.html"]
+          try_files: ["{path}", "/index.html"]
+  https:
+    enabled: true
+    redirect: true
+```
+
+### Container-Based Application with Custom Networks
+```yaml
+version: "1.0"
+
+app:
+  name: container-app
+
+services:
+  app:
+    image: myapp:latest
+    instances: 2
+    ports:
+      - "8000:8000"
+    networks:
+      - app_network
+    environment:
+      DATABASE_URL: postgresql://db:5432/app
+    depends_on:
+      - db
+
+  db:
+    image: postgres:15
+    networks:
+      - app_network
+    volumes:
+      - "postgres_data:/var/lib/postgresql/data"
+    environment:
+      POSTGRES_DB: app
+
+volumes:
+  postgres_data:
+
+networks:
+  app_network:
+    driver: bridge
+
+caddy:
+  routes:
+    - handle:
+        - handler: reverse_proxy
+          upstreams:
+            - dial: "app:8000"
+  https:
+    enabled: true
+```
+
+## Limitations (Current Implementation)
+
+* Single-host focus (Swarm optional but used minimally)
+* No horizontal scaling flags (`instances`) or healthcheck synthesis
+* No build pipeline abstraction; you provide ready-to-run code / image
+* No systemd / Podman integration (Docker only)
+* No scheduled jobs / timers
+* No integrated log rotation or log viewing commands
+* Caddy integration limited to injecting supplied server object (no templating / multi-env layering)
+
+## Planned / Roadmap (Focused)
+
+Near‑term priorities only (longer speculative list removed):
+1. Additional runtimes (Go, Rust, static) via `runtime:` images
+2. Basic scaling & healthcheck fields mapped to Swarm / Compose
+3. Log tail / follow helper (`kata logs <app> [service]`)
+4. Config mutation commands (`config:set|unset`) with persistence
+5. Optional HTTP→HTTPS redirect helper in Caddy injection
+
+---
+
+This document should be updated alongside code changes; discrepancies mean the code is authoritative.
 
-2. For web applications:
-   - uWSGI runs them as `attach-daemon` processes
-   - Nginx proxies requests to their bound TCP port
-   - Proxy configuration includes WebSocket upgrade headers
-
-3. For PHP applications:
-   - uWSGI runs with `http` plugin binding to the assigned PORT
-   - Static files are handled directly by uWSGI with `check-static`
-
-4. For static applications:
-   - No uWSGI process is created
-   - Nginx serves files directly from the specified path
-
-## Language-Specific Configuration
-
-### Node.js
-
-Node.js applications can be configured with additional environment variables:
-
-- `NODE_VERSION`: Specify the Node.js version to use (requires nodeenv)
-- `NODE_PACKAGE_MANAGER`: Specify an alternative package manager (default: "npm --package-lock=false")
-- `NODE_PATH`: Path to node modules
-- `NPM_CONFIG_PREFIX`: NPM prefix configuration
-
-### Node.js Environment Management
-
-Piku provides advanced Node.js environment management:
-
-1. **Version Management:**
-   - Uses `nodeenv` to create isolated Node.js environments
-   - Supports specific Node.js versions via `NODE_VERSION` environment variable
-   - Prevents version changes while the application is running
-   - Uses prebuilt binaries for faster installation (`--prebuilt` flag)
-
-2. **Package Management:**
-   - Creates a dedicated `node_modules` directory in the environment path
-   - Symlinks this directory to the application root for compatibility
-   - Supports custom package managers via `NODE_PACKAGE_MANAGER` environment variable
-   - Default package manager is `npm --package-lock=false`
-   - Automatically installs alternative package managers via npm if specified
-   - Copies package.json to the environment directory to ensure consistent installations
-
-3. **Environment Integration:**
-   - Adds Node.js bin directories to the PATH automatically
-   - Sets NODE_PATH to enable proper module resolution
-   - Configures NPM_CONFIG_PREFIX to maintain isolation between applications
-
-### Python
-
-Python applications can be configured with additional environment variables:
-
-- `PYTHON_VERSION`: Python version to use (default: "3")
-- `PYTHONUNBUFFERED`: Set to "1" for unbuffered output (default)
-- `PYTHONIOENCODING`: Set to "UTF_8:replace" for readable UTF-8 mapping (default)
-
-### Python Environment Management
-
-Piku supports multiple Python package management approaches:
-
-1. **Standard Virtualenv + requirements.txt:**
-   - Creates a virtualenv using the Python version specified in PYTHON_VERSION (defaults to 3)
-   - Installs requirements from requirements.txt using pip
-   - Activates the environment during deployment using activate_this.py
-   - Rebuilds/updates if requirements.txt has changed since last deployment
-
-2. **Poetry:**
-   - Experimental support for Poetry projects with pyproject.toml
-   - Sets POETRY_VIRTUALENVS_IN_PROJECT=1 to keep virtualenv in project
-   - Creates a .venv symlink in app directory pointing to the environment path
-   - Uses poetry install for dependency management
-   - Inherits all environment variables from the deployment environment
-
-3. **UV:**
-   - Experimental support for uv package manager with pyproject.toml
-   - Sets UV_PROJECT_ENVIRONMENT to point to the environment path
-   - Uses uv sync with --python-preference only-system flag
-   - Compatible with any Python project using pyproject.toml
-
-### Go Environment Management
-
-Piku offers specific handling for Go applications:
-
-1. **Environment Setup:**
-   - Creates a dedicated GOPATH in the environment directory
-   - If available, copies a pre-built GOPATH structure to save provisioning time
-   - Handles both older Godeps-style dependencies and modern go.mod projects
-
-2. **Dependency Management:**
-   - Detects changes in Godeps directory and runs `godep update` when needed
-   - For go.mod projects, runs `go mod tidy` to ensure dependencies are up to date
-   - Sets appropriate Go environment variables (GOPATH, GOROOT, GO15VENDOREXPERIMENT)
-
-### Ruby Environment Management
-
-Piku provides a streamlined approach for Ruby applications:
-
-1. **Environment Setup:**
-   - Creates a dedicated directory for the Ruby application's dependencies
-   - Sets up proper Ruby environment variables and PATH
-   - Uses Bundler to manage gems in an isolated environment
-
-2. **Dependency Management:**
-   - Configures Bundler to store gems in the application's environment path
-   - Uses `bundle config set --local path $VIRTUAL_ENV` for isolation
-   - Runs `bundle install` to install or update dependencies
-   - Preserves existing environments during rebuilds
-
-### Java Environment Management
-
-Piku provides two approaches for Java applications:
-
-1. **Maven Projects:**
-   - Sets up a dedicated path for Java applications in the environment directory
-   - Automatically runs `mvn package` for first-time deployments
-   - Uses `mvn clean package` for subsequent deployments
-   - Detects changes by checking for the presence of the target directory
-   - A TODO in the code suggests future jenv integration for Java version isolation
-
-2. **Gradle Projects:**
-   - Sets up dedicated environment directory similarly to Maven projects
-   - Runs `gradle build` for first-time deployments
-   - Uses `gradle clean build` for subsequent deployments
-
-### Clojure Environment Management
-
-Piku supports two Clojure build systems:
-
-1. **Clojure CLI (deps.edn):**
-   - Creates a dedicated environment directory
-   - Sets CLJ_CONFIG to reference user's .clojure directory or custom location
-   - Uses `clojure -T:build release` to build the application
-
-2. **Leiningen (project.clj):**
-   - Creates a dedicated environment directory
-   - Sets LEIN_HOME to reference user's .lein directory or custom location
-   - Uses the sequence of `lein clean` followed by `lein uberjar` for builds
-
-### Rust Environment Management
-
-Piku provides basic support for Rust applications:
-
-1. **Project Requirements:**
-   - Requires both `Cargo.toml` and `rust-toolchain.toml` files to be detected as a Rust application
-   - Uses standard Cargo build process
-
-2. **Build Process:**
-   - Simply runs `cargo build` in the application directory
-   - Does not create a separate environment directory like other runtimes
-   - Relies on Cargo's built-in dependency management
-
-### Other Runtime Settings
-
-- `PIKU_AUTO_RESTART`: Automatically restart application on deployment (true/false, default: true)
-- `BIND_ADDRESS`: Address to bind application to (default: 127.0.0.1)
-- `PORT`: Port to bind application to (automatically assigned if not specified)
-
-## SSH Key Management and Git Integration
-
-Piku uses SSH as its primary mechanism for secure deployments and management:
-
-### SSH Key Setup
-
-1. **Authorized Keys Configuration**
-   - Piku adds entries to the user's `~/.ssh/authorized_keys` file
-   - Each key is configured with specific restrictions:
-     - `command="FINGERPRINT={fingerprint} NAME=default {piku_script} $SSH_ORIGINAL_COMMAND"`
-     - `no-agent-forwarding,no-user-rc,no-X11-forwarding,no-port-forwarding`
-   - The SSH fingerprint is captured and passed as an environment variable to Piku
-   - All SSH commands are forced through the Piku script for security
-
-2. **SSH Command Handling**
-   - The setup:ssh command accepts a path to a public key file or '-' for stdin
-   - Keys are validated before being added (invalid keys are rejected)
-   - The fingerprint is extracted using ssh-keygen
-
-### Git Push Deployment Flow
-
-1. **Repository Initialization**
-   - When a user first pushes to a non-existent app, Piku:
-     - Creates a bare Git repository in `$HOME/.piku/repos/<app>`
-     - Sets up a post-receive hook that triggers the Piku git-hook command
-     - Makes the hook executable with appropriate permissions
-
-2. **Git Commands Handling**
-   - Piku handles three git commands:
-     - `git-receive-pack`: Processes incoming git pushes
-     - `git-upload-pack`: Handles git pulls and fetches
-     - `git-hook`: Post-receive hook that triggers the actual deployment
-
-3. **Deployment Process**
-   - Upon receiving a push, the post-receive hook:
-     - Reads the oldrev, newrev, and ref from stdin
-     - Creates the application directory if it doesn't exist
-     - Clones the repository to the app directory
-     - Triggers the deployment process with the newrev
-
-4. **Security Considerations**
-   - All git operations are handled through git-shell for security
-   - The commands and their options are strictly controlled
-   - Repository access is limited to the specific app being pushed
-
-5. **SCP Support**
-   - Piku also provides an SCP wrapper to allow secure file copying
-   - This uses the same authentication mechanism as git pushes
-
-## Command Line Interface
-
-Piku provides a CLI with the following commands:
-
-### Application Management
-
-- `piku apps`: List applications
-- `piku deploy <app>`: Deploy an application
-- `piku destroy <app>`: Destroy an application
-- `piku restart <app>`: Restart an application
-- `piku stop <app>`: Stop an application
-- `piku ps <app>`: Show process information
-- `piku ps:scale <app> <proc>=<count>`: Scale processes
-
-### Configuration
-
-- `piku config <app>`: Show configuration
-- `piku config:get <app> <setting>`: Get a configuration value
-- `piku config:set <app> <key>=<value> [...]`: Set configuration values
-- `piku config:unset <app> <key> [...]`: Unset configuration values
-- `piku config:live <app>`: Show live configuration
-
-### Logging
-
-- `piku logs <app> [<process>]`: View application logs
-
-### Utilities
-
-- `piku run <app> <cmd>`: Run a command in the application environment
-- `piku setup`: Initialize the Piku environment
-- `piku setup:ssh <public_key_file>`: Set up SSH keys for deployment
-- `piku update`: Update the Piku CLI
-- `piku help`: Display help for piku commands
-
-### Internal Commands
-
-- `piku git-hook <app>`: Git post-receive hook handler
-- `piku git-receive-pack <app>`: Git push handler
-- `piku git-upload-pack <app>`: Git pull handler
-- `piku scp`: SCP wrapper
-
-## Deployment Process
-
-1. User pushes code to the Piku server via git
-2. The git-hook is triggered
-3. Piku detects the application type based on files in the repository
-4. Piku creates or updates the virtual environment/dependencies
-5. Piku generates uWSGI and Nginx configurations
-6. Piku starts the application processes
-
-## Security
-
-- SSH key-based authentication for git deployments
-- Uses Unix permissions for file isolation
-- Supports SSL/TLS via Let's Encrypt integration
-- CloudFlare IP restrictions option
-
-## Log Management
-
-Piku configures comprehensive logging for all applications:
-
-1. **Log File Management:**
-   - Log files are stored in `$HOME/.piku/logs/<app>/<worker_type>.<instance_number>.log`
-   - Log rotation is handled by uWSGI with backup files named `.old`
-   - Log permissions are set to 640 with proper user/group ownership
-   - Maximum log size is controlled via `UWSGI_LOG_MAXSIZE` (default: 1048576 bytes)
-
-2. **Log Formats:**
-   - WSGI and web processes use a detailed log format that includes:
-     - Client address
-     - Username
-     - Timestamp in local time
-     - HTTP method, URI, and protocol
-     - Status code
-     - Response size
-     - Referer
-     - User agent
-     - Response time in milliseconds
-   - The `logs` command can tail multiple log files with process type prefixes
-
-3. **Custom Logging:**
-   - X-Forwarded-For logging can be enabled with `UWSGI_LOG_X_FORWARDED_FOR`
-   - When CloudFlare integration is active, the `CF-Connecting-IP` header is properly mapped
-
-## Limitations
-
-- Designed for single-server deployments
-- No built-in clustering or high-availability features
-- Single user model (runs under the same Unix user)
